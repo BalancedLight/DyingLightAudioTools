@@ -79,6 +79,15 @@ class DyingAudioApp(tk.Tk):
         self.task_progress_var = tk.DoubleVar(value=0.0)
         self.task_status_var = tk.StringVar(value="No DL1 task running.")
         self._dl1_busy_widgets: list[tk.Widget] = []
+        self.loading_window: tk.Toplevel | None = None
+        self.loading_status_label: ttk.Label | None = None
+        self.loading_progress: ttk.Progressbar | None = None
+        self.loading_gif_label: ttk.Label | None = None
+        self._loading_gif_cache: dict[int, tk.PhotoImage] = {}
+        self._loading_gif_frame_count: int | None = None
+        self._loading_gif_subsample = 1
+        self._loading_gif_after_id: str | None = None
+        self._loading_gif_frame_index = 0
 
         self.selected_name_var = tk.StringVar()
         self.selected_type_var = tk.StringVar(value="2")
@@ -479,10 +488,7 @@ class DyingAudioApp(tk.Tk):
         self.build_mod_button.grid(row=0, column=4, sticky="ew", padx=2)
         self.open_mod_folder_button = ttk.Button(actions, text="Open Mod Folder", command=self._open_mod_folder)
         self.open_mod_folder_button.grid(row=0, column=5, sticky="ew", padx=2)
-        self.task_progress = ttk.Progressbar(actions, maximum=100, variable=self.task_progress_var)
-        self.task_progress.grid(row=1, column=0, columnspan=6, sticky="ew", padx=4, pady=(4, 0))
-        ttk.Label(actions, textvariable=self.task_status_var).grid(row=2, column=0, columnspan=6, sticky="w", padx=4, pady=(4, 0))
-        ttk.Label(actions, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="e", padx=4, pady=(4, 0))
+        ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=6, sticky="e", padx=4, pady=(4, 0))
         self._dl1_busy_widgets = [
             self.add_audio_button,
             self.add_fsb_button,
@@ -527,21 +533,172 @@ class DyingAudioApp(tk.Tk):
         for widget in self._dl1_busy_widgets:
             widget.configure(state="disabled" if busy else "normal")
 
+    def _cancel_loading_animation(self) -> None:
+        if self._loading_gif_after_id is None:
+            return
+        try:
+            self.after_cancel(self._loading_gif_after_id)
+        except tk.TclError:
+            pass
+        self._loading_gif_after_id = None
+
+    def _animate_loading_gif(self) -> None:
+        self._loading_gif_after_id = None
+        if self.loading_gif_label is None:
+            return
+        frame = self._load_loading_gif_frame(self._loading_gif_frame_index)
+        if frame is None:
+            self.loading_gif_label.configure(text="Working...")
+            self.loading_gif_label.image = None
+            return
+        self.loading_gif_label.configure(image=frame)
+        self.loading_gif_label.image = frame
+        next_index = self._loading_gif_frame_index + 1
+        if self._load_loading_gif_frame(next_index) is None:
+            next_index = 0
+        self._loading_gif_frame_index = next_index
+        self._loading_gif_after_id = self.after(80, self._animate_loading_gif)
+
+    def _load_loading_gif_frame(self, index: int) -> tk.PhotoImage | None:
+        if index < 0:
+            return None
+        if self._loading_gif_frame_count is not None and index >= self._loading_gif_frame_count:
+            return None
+        if index in self._loading_gif_cache:
+            return self._loading_gif_cache[index]
+        gif_path = application_root() / "assets" / "MovingGears.gif"
+        if not gif_path.exists():
+            self._loading_gif_frame_count = 0
+            return None
+        try:
+            frame = tk.PhotoImage(file=str(gif_path), format=f"gif -index {index}")
+        except tk.TclError:
+            self._loading_gif_frame_count = index
+            return None
+
+        if not self._loading_gif_cache:
+            max_dimension = max(frame.width(), frame.height())
+            self._loading_gif_subsample = max(1, (max_dimension + 159) // 160)
+        if self._loading_gif_subsample > 1:
+            frame = frame.subsample(self._loading_gif_subsample, self._loading_gif_subsample)
+        self._loading_gif_cache[index] = frame
+        return frame
+
+    def _center_child_window(self, window: tk.Toplevel, width: int, height: int) -> None:
+        self.update_idletasks()
+        window.update_idletasks()
+        root_x = self.winfo_rootx()
+        root_y = self.winfo_rooty()
+        root_width = self.winfo_width()
+        root_height = self.winfo_height()
+        x = root_x + max(0, (root_width - width) // 2)
+        y = root_y + max(0, (root_height - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _show_loading_window(self, message: str) -> None:
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.task_status_var.set(message)
+            self._center_loading_window()
+            self.loading_window.deiconify()
+            self.loading_window.lift()
+            self.loading_window.update_idletasks()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("DyingAudio Progress")
+        window.transient(self)
+        window.minsize(340, 240)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(window, padding=18)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=0)
+        container.rowconfigure(1, weight=1)
+        container.rowconfigure(2, weight=0)
+
+        status_frame = ttk.Frame(container, height=68)
+        status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.grid_propagate(False)
+
+        status_label = ttk.Label(status_frame, textvariable=self.task_status_var, anchor="center", justify="center", wraplength=320)
+        status_label.grid(row=0, column=0, sticky="nsew")
+
+        gif_frame = ttk.Frame(container, width=160, height=160)
+        gif_frame.grid(row=1, column=0, sticky="n", pady=(0, 14))
+        gif_frame.grid_propagate(False)
+
+        gif_label = ttk.Label(gif_frame, anchor="center")
+        gif_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        progress = ttk.Progressbar(container, maximum=100, variable=self.task_progress_var)
+        progress.grid(row=2, column=0, sticky="ew")
+
+        self.loading_window = window
+        self.loading_status_label = status_label
+        self.loading_progress = progress
+        self.loading_gif_label = gif_label
+        self.task_status_var.set(message)
+
+        self._loading_gif_frame_index = 0
+        self._cancel_loading_animation()
+        self._animate_loading_gif()
+
+        window.bind("<Configure>", self._on_loading_window_configure)
+        self._center_loading_window()
+        window.lift()
+        window.update_idletasks()
+        window.focus_set()
+
+    def _center_loading_window(self) -> None:
+        if self.loading_window is None or not self.loading_window.winfo_exists():
+            return
+        width = max(self.loading_window.winfo_width(), self.loading_window.winfo_reqwidth(), 420)
+        height = max(self.loading_window.winfo_height(), self.loading_window.winfo_reqheight(), 300)
+        self._center_child_window(self.loading_window, width, height)
+
+    def _on_loading_window_configure(self, event: object) -> None:
+        if self.loading_status_label is None or not hasattr(event, "width"):
+            return
+        width = max(220, int(event.width) - 36)
+        self.loading_status_label.configure(wraplength=width)
+
+    def _close_loading_window(self) -> None:
+        self._cancel_loading_animation()
+        if self.loading_progress is not None:
+            self.loading_progress.stop()
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.loading_window.destroy()
+        self.loading_window = None
+        self.loading_status_label = None
+        self.loading_progress = None
+        self.loading_gif_label = None
+
     def _apply_task_progress(self, progress: TaskProgress) -> None:
         self.task_status_var.set(progress.message or "Working...")
+        if self.loading_progress is None:
+            return
         if progress.is_determinate:
-            self.task_progress.stop()
-            self.task_progress.configure(mode="determinate")
+            self.loading_progress.stop()
+            self.loading_progress.configure(mode="determinate")
             self.task_progress_var.set(progress.percent)
         else:
             self.task_progress_var.set(0.0)
-            self.task_progress.configure(mode="indeterminate")
-            self.task_progress.start(15)
+            self.loading_progress.configure(mode="indeterminate")
+            self.loading_progress.start(15)
 
     def _finish_task_ui(self) -> None:
-        self.task_progress.stop()
-        self.task_progress.configure(mode="determinate")
+        if self.loading_progress is not None:
+            self.loading_progress.stop()
+            self.loading_progress.configure(mode="determinate")
         self.task_progress_var.set(0.0)
+        self._close_loading_window()
         self._set_dl1_busy(False)
 
     def _run_dl1_task(
@@ -558,20 +715,25 @@ class DyingAudioApp(tk.Tk):
         self._set_dl1_busy(True)
         self.task_status_var.set(start_message)
         self.status_var.set(start_message)
+        self.task_progress_var.set(0.0)
+        self._show_loading_window(start_message)
 
         def handle_error(exc: BaseException, details: str) -> None:
             self._append_log(details.rstrip())
             messagebox.showerror(error_title, str(exc))
             self.status_var.set(error_title.replace(" failed", " failed."))
 
-        self.task_runner.start(
-            worker,
-            on_progress=self._apply_task_progress,
-            on_log=self._append_log,
-            on_success=on_success,
-            on_error=handle_error,
-            on_finally=self._finish_task_ui,
-        )
+        def start_background_task() -> None:
+            self.task_runner.start(
+                worker,
+                on_progress=self._apply_task_progress,
+                on_log=self._append_log,
+                on_success=on_success,
+                on_error=handle_error,
+                on_finally=self._finish_task_ui,
+            )
+
+        self.after(10, start_background_task)
 
     def _toggle_sort_direction(self) -> None:
         if self.sort_field_var.get().strip() == "Original Order":
@@ -1723,6 +1885,7 @@ class DyingAudioApp(tk.Tk):
         self._save_settings()
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
+        self._close_loading_window()
         self.preview_player.close()
         if self.experimental_frame is not None:
             self.experimental_frame.shutdown()

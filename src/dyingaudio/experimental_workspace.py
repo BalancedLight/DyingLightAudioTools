@@ -34,7 +34,9 @@ from dyingaudio.settings import (
     DEFAULT_EXPERIMENTAL_CACHE_ROOT,
     DEFAULT_EXPERIMENTAL_GAME,
     ExperimentalSettings,
+    application_root,
     discover_game_root,
+    is_windows_dark_mode,
 )
 
 
@@ -193,6 +195,16 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.task_progress_var = tk.DoubleVar(value=0.0)
         self.task_runner = BackgroundTaskRunner(self)
         self._busy_widgets: list[tk.Widget] = []
+        self.task_progress: ttk.Progressbar | None = None
+        self.loading_window: tk.Toplevel | None = None
+        self.loading_status_label: ttk.Label | None = None
+        self.loading_progress: ttk.Progressbar | None = None
+        self.loading_gif_label: ttk.Label | None = None
+        self._loading_gif_cache: dict[int, tk.PhotoImage] = {}
+        self._loading_gif_frame_count: int | None = None
+        self._loading_gif_subsample = 1
+        self._loading_gif_after_id: str | None = None
+        self._loading_gif_frame_index = 0
         self.media_iid_rows: dict[str, list[NamedAudioLink]] = {}
         self.media_group_iids: set[str] = set()
         self._media_render_after_id: str | None = None
@@ -227,6 +239,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def shutdown(self) -> None:
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
+        self._close_loading_window()
         self._cancel_media_render()
         self.preview_player.close()
 
@@ -265,9 +278,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
         ttk.Label(controls, textvariable=self.workspace_var).grid(row=2, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
         ttk.Label(controls, textvariable=self.preview_tools_var).grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
-        self.task_progress = ttk.Progressbar(controls, maximum=100, variable=self.task_progress_var)
-        self.task_progress.grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 4))
-        ttk.Label(controls, textvariable=self.task_status_var).grid(row=5, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
+        ttk.Label(controls, textvariable=self.task_status_var).grid(row=4, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
 
         content = ttk.Panedwindow(self, orient="horizontal")
         content.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
@@ -276,12 +287,12 @@ class ExperimentalWwiseFrame(ttk.Frame):
         left = ttk.LabelFrame(content, text="Archives / Banks / Events")
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
-        content.add(left, weight=2)
+        content.add(left, weight=4)
 
         center = ttk.LabelFrame(content, text="Media")
         center.columnconfigure(0, weight=1)
         center.rowconfigure(1, weight=1)
-        content.add(center, weight=3)
+        content.add(center, weight=5)
 
         right = ttk.Notebook(content)
         content.add(right, weight=2)
@@ -419,10 +430,160 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self.export_dump_button,
         ]
         self.after_idle(self._ensure_default_pane_layout)
+        self.after(100, self._ensure_default_pane_layout)
+        self.after(500, self._ensure_default_pane_layout)
         self.bind("<Configure>", self._on_frame_configure)
+        self.bind("<Visibility>", self._on_frame_configure, add="+")
 
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def _cancel_loading_animation(self) -> None:
+        if self._loading_gif_after_id is None:
+            return
+        try:
+            self.after_cancel(self._loading_gif_after_id)
+        except tk.TclError:
+            pass
+        self._loading_gif_after_id = None
+
+    def _animate_loading_gif(self) -> None:
+        self._loading_gif_after_id = None
+        if self.loading_gif_label is None:
+            return
+        frame = self._load_loading_gif_frame(self._loading_gif_frame_index)
+        if frame is None:
+            self.loading_gif_label.configure(text="Working...")
+            self.loading_gif_label.image = None
+            return
+        self.loading_gif_label.configure(image=frame)
+        self.loading_gif_label.image = frame
+        next_index = self._loading_gif_frame_index + 1
+        if self._load_loading_gif_frame(next_index) is None:
+            next_index = 0
+        self._loading_gif_frame_index = next_index
+        self._loading_gif_after_id = self.after(80, self._animate_loading_gif)
+
+    def _load_loading_gif_frame(self, index: int) -> tk.PhotoImage | None:
+        if index < 0:
+            return None
+        if self._loading_gif_frame_count is not None and index >= self._loading_gif_frame_count:
+            return None
+        if index in self._loading_gif_cache:
+            return self._loading_gif_cache[index]
+        gif_path = application_root() / "assets" / "MovingGears.gif"
+        if not gif_path.exists():
+            self._loading_gif_frame_count = 0
+            return None
+        try:
+            frame = tk.PhotoImage(file=str(gif_path), format=f"gif -index {index}")
+        except tk.TclError:
+            self._loading_gif_frame_count = index
+            return None
+
+        if not self._loading_gif_cache:
+            max_dimension = max(frame.width(), frame.height())
+            self._loading_gif_subsample = max(1, (max_dimension + 159) // 160)
+        if self._loading_gif_subsample > 1:
+            frame = frame.subsample(self._loading_gif_subsample, self._loading_gif_subsample)
+        self._loading_gif_cache[index] = frame
+        return frame
+
+    def _center_child_window(self, window: tk.Toplevel, width: int, height: int) -> None:
+        self.update_idletasks()
+        window.update_idletasks()
+        root_x = self.winfo_rootx()
+        root_y = self.winfo_rooty()
+        root_width = self.winfo_width()
+        root_height = self.winfo_height()
+        x = root_x + max(0, (root_width - width) // 2)
+        y = root_y + max(0, (root_height - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _show_loading_window(self, message: str) -> None:
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.task_status_var.set(message)
+            self._center_loading_window()
+            self.loading_window.deiconify()
+            self.loading_window.lift()
+            self.loading_window.update_idletasks()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("DyingAudio Progress")
+        window.transient(self)
+        window.minsize(340, 240)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(window, padding=18)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=0)
+        container.rowconfigure(1, weight=1)
+        container.rowconfigure(2, weight=0)
+
+        status_frame = ttk.Frame(container, height=68)
+        status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.grid_propagate(False)
+
+        status_label = ttk.Label(status_frame, textvariable=self.task_status_var, anchor="center", justify="center", wraplength=320)
+        status_label.grid(row=0, column=0, sticky="nsew")
+
+        gif_frame = ttk.Frame(container, width=160, height=160)
+        gif_frame.grid(row=1, column=0, sticky="n", pady=(0, 14))
+        gif_frame.grid_propagate(False)
+
+        gif_label = ttk.Label(gif_frame, anchor="center")
+        gif_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        progress = ttk.Progressbar(container, maximum=100, variable=self.task_progress_var)
+        progress.grid(row=2, column=0, sticky="ew")
+
+        self.loading_window = window
+        self.loading_status_label = status_label
+        self.loading_progress = progress
+        self.loading_gif_label = gif_label
+        self.task_status_var.set(message)
+
+        self._loading_gif_frame_index = 0
+        self._cancel_loading_animation()
+        self._animate_loading_gif()
+
+        window.bind("<Configure>", self._on_loading_window_configure)
+        self._center_loading_window()
+        window.lift()
+        window.update_idletasks()
+        window.focus_set()
+
+    def _center_loading_window(self) -> None:
+        if self.loading_window is None or not self.loading_window.winfo_exists():
+            return
+        width = max(self.loading_window.winfo_width(), self.loading_window.winfo_reqwidth(), 420)
+        height = max(self.loading_window.winfo_height(), self.loading_window.winfo_reqheight(), 300)
+        self._center_child_window(self.loading_window, width, height)
+
+    def _on_loading_window_configure(self, event: object) -> None:
+        if self.loading_status_label is None or not hasattr(event, "width"):
+            return
+        width = max(220, int(event.width) - 36)
+        self.loading_status_label.configure(wraplength=width)
+
+    def _close_loading_window(self) -> None:
+        self._cancel_loading_animation()
+        if self.loading_progress is not None:
+            self.loading_progress.stop()
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.loading_window.destroy()
+        self.loading_window = None
+        self.loading_status_label = None
+        self.loading_progress = None
+        self.loading_gif_label = None
 
     def _on_frame_configure(self, _event: object) -> None:
         self._ensure_default_pane_layout()
@@ -435,17 +596,17 @@ class ExperimentalWwiseFrame(ttk.Frame):
             if total_width <= 1:
                 return
 
-            left_width = max(260, int(total_width * 0.24))
-            middle_width = max(420, int(total_width * 0.50))
-            right_min_start = total_width - 320
+            left_width = max(320, int(total_width * 0.30))
+            middle_width = max(420, int(total_width * 0.46))
+            right_min_start = total_width - 280
             first_sash = self.content_paned.sashpos(0)
             second_sash = self.content_paned.sashpos(1)
 
-            if (not self._pane_layout_initialized) or first_sash < 160 or second_sash <= first_sash + 120:
-                first_target = min(left_width, total_width - 700)
-                first_target = max(260, first_target)
-                second_target = min(max(first_target + middle_width, first_target + 420), right_min_start)
-                second_target = max(first_target + 420, second_target)
+            if (not self._pane_layout_initialized) or first_sash < 240 or second_sash <= first_sash + 160:
+                first_target = min(left_width, total_width - 760)
+                first_target = max(320, first_target)
+                second_target = min(max(first_target + middle_width, first_target + 460), right_min_start)
+                second_target = max(first_target + 460, second_target)
                 self.content_paned.sashpos(0, first_target)
                 self.content_paned.sashpos(1, second_target)
                 self._pane_layout_initialized = True
@@ -460,6 +621,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _apply_task_progress(self, progress: TaskProgress) -> None:
         self.task_status_var.set(progress.message or "Working...")
+        if self.task_progress is None:
+            return
         if progress.is_determinate:
             self.task_progress.stop()
             self.task_progress.configure(mode="determinate")
@@ -470,9 +633,11 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self.task_progress.start(15)
 
     def _finish_task_ui(self) -> None:
-        self.task_progress.stop()
-        self.task_progress.configure(mode="determinate")
+        if self.task_progress is not None:
+            self.task_progress.stop()
+            self.task_progress.configure(mode="determinate")
         self.task_progress_var.set(0.0)
+        self._close_loading_window()
         self._set_task_busy(False)
 
     def _cancel_task(self) -> None:
@@ -497,6 +662,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.task_status_var.set(start_message)
         self._append_status(start_message)
         self._set_text_widget(self.logs_text, start_message)
+        self._show_loading_window(start_message)
 
         def handle_error(exc: BaseException, details: str) -> None:
             if isinstance(exc, TaskCancelled):
