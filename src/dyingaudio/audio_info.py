@@ -4,7 +4,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from dyingaudio.core.media_tools import discover_media_tools, ffprobe_audio
+from dyingaudio.core.media_tools import discover_media_tools, ffprobe_audio, vgmstream_probe_audio
 
 
 @dataclass(slots=True)
@@ -86,7 +86,16 @@ def probe_audio_metadata(path: str | Path) -> AudioMetadata:
     if suffix == ".ogg":
         return _probe_ogg_vorbis(resolved)
 
-    ffprobe_result = ffprobe_audio(resolved, discover_media_tools())
+    tools = discover_media_tools()
+    if suffix == ".wem":
+        vgmstream_result = vgmstream_probe_audio(resolved, tools)
+        if vgmstream_result is not None:
+            duration_seconds, detected_sample_rate, sample_count, notes = vgmstream_result
+            metadata = _metadata_from_duration(duration_seconds, detected_sample_rate, notes)
+            metadata.sample_count_48k = sample_count
+            return metadata
+
+    ffprobe_result = ffprobe_audio(resolved, tools)
     if ffprobe_result is not None:
         duration_seconds, detected_sample_rate, notes = ffprobe_result
         return _metadata_from_duration(duration_seconds, detected_sample_rate, notes)

@@ -7,6 +7,7 @@ import tempfile
 import traceback
 import time
 import tkinter as tk
+import winsound
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -23,6 +24,7 @@ from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
 from dyingaudio.models import AudioEntry
+from dyingaudio.other_workspace import OtherWorkspaceFrame
 from dyingaudio.settings import (
     AppSettings,
     DEFAULT_AUDIO_PROCS,
@@ -48,6 +50,7 @@ class DyingAudioApp(tk.Tk):
 
         self.settings = load_settings()
         self.experimental_frame: ExperimentalWwiseFrame | None = None
+        self.other_frame: OtherWorkspaceFrame | None = None
         self.entries: list[AudioEntry] = []
         self.current_toolchain: DldtToolchain | None = None
         self.last_built_mod_root: Path | None = None
@@ -88,6 +91,12 @@ class DyingAudioApp(tk.Tk):
         self._loading_gif_subsample = 1
         self._loading_gif_after_id: str | None = None
         self._loading_gif_frame_index = 0
+
+        self.error_warning_window: tk.Toplevel | None = None
+        self.error_warning_title_label: ttk.Label | None = None
+        self.error_warning_message_label: ttk.Label | None = None
+        self.error_warning_icon_label: ttk.Label | None = None
+        self.error_warning_ok_button: ttk.Button | None = None
 
         self.selected_name_var = tk.StringVar()
         self.selected_type_var = tk.StringVar(value="2")
@@ -205,7 +214,7 @@ class DyingAudioApp(tk.Tk):
         details = "".join(traceback.format_exception(exc, val, tb))
         self._append_log(details.rstrip())
         self.status_var.set("An unexpected error occurred.")
-        messagebox.showerror("Unexpected error", str(val))
+        self._show_error_window("Unexpected error", str(val))
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -219,8 +228,11 @@ class DyingAudioApp(tk.Tk):
         self.dl1_tab.rowconfigure(0, weight=1)
         self.notebook.add(self.dl1_tab, text="Dying Light 1")
 
-        self.experimental_frame = ExperimentalWwiseFrame(self.notebook, self.settings.experimental)
+        self.experimental_frame = ExperimentalWwiseFrame(self.notebook, self.settings.experimental, self)
         self.notebook.add(self.experimental_frame, text="Dying Light 2 / The Beast (Experimental)")
+
+        self.other_frame = OtherWorkspaceFrame(self.notebook, self.settings.other, self)
+        self.notebook.add(self.other_frame, text="Other")
 
         self.main_frame = ttk.Frame(self.dl1_tab)
         self.main_frame.grid(row=0, column=0, sticky="nsew")
@@ -701,6 +713,126 @@ class DyingAudioApp(tk.Tk):
         self._close_loading_window()
         self._set_dl1_busy(False)
 
+    def _show_error_window(self, title: str, message: str) -> None:
+        self._show_error_warning_window(title, message, "error")
+
+    def _show_warning_window(self, title: str, message: str) -> None:
+        self._show_error_warning_window(title, message, "warning")
+
+    def _show_error_warning_window(self, title: str, message: str, kind: str) -> None:
+        # Play system sound
+        try:
+            if kind == "error":
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+            elif kind == "warning":
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except (ImportError, AttributeError, OSError):
+            # winsound not available or failed, silently continue
+            pass
+        
+        if self.error_warning_window is not None and self.error_warning_window.winfo_exists():
+            self.error_warning_title_label.configure(text=title)
+            self.error_warning_message_label.configure(text=message)
+            self._update_error_warning_icon(kind)
+            self._center_error_warning_window()
+            self.error_warning_window.deiconify()
+            self.error_warning_window.lift()
+            self.error_warning_window.update_idletasks()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("DyingAudio")
+        window.transient(self)
+        window.minsize(300, 200)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._close_error_warning_window)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(window, padding=18)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=0)
+        container.rowconfigure(1, weight=0)
+        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=0)
+
+        title_label = ttk.Label(container, text=title, font=("TkDefaultFont", 12, "bold"), anchor="center")
+        title_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        icon_frame = ttk.Frame(container, width=64, height=64)
+        icon_frame.grid(row=1, column=0, sticky="n", pady=(0, 10))
+        icon_frame.grid_propagate(False)
+
+        icon_label = ttk.Label(icon_frame, anchor="center")
+        icon_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        message_label = ttk.Label(container, text=message, anchor="center", justify="center", wraplength=280)
+        message_label.grid(row=2, column=0, sticky="ew", pady=(0, 20))
+
+        ok_button = ttk.Button(container, text="OK", command=self._close_error_warning_window)
+        ok_button.grid(row=3, column=0, sticky="s")
+
+        self.error_warning_window = window
+        self.error_warning_title_label = title_label
+        self.error_warning_message_label = message_label
+        self.error_warning_icon_label = icon_label
+        self.error_warning_ok_button = ok_button
+
+        self._update_error_warning_icon(kind)
+
+        window.bind("<Configure>", self._on_error_warning_window_configure)
+        self._center_error_warning_window()
+        window.lift()
+        window.update_idletasks()
+        window.focus_set()
+
+    def _update_error_warning_icon(self, kind: str) -> None:
+        if self.error_warning_icon_label is None:
+            return
+        icon_path = application_root() / "assets" / f"{kind}.png"
+        if not icon_path.exists():
+            self.error_warning_icon_label.configure(text=kind.upper())
+            self.error_warning_icon_label.image = None
+            return
+        try:
+            icon = tk.PhotoImage(file=str(icon_path))
+            # Scale down if too large
+            max_size = 48
+            if icon.width() > max_size or icon.height() > max_size:
+                scale = max(icon.width(), icon.height()) / max_size
+                subsample = max(1, int(scale))
+                icon = icon.subsample(subsample, subsample)
+            self.error_warning_icon_label.configure(image=icon)
+            self.error_warning_icon_label.image = icon
+        except tk.TclError:
+            self.error_warning_icon_label.configure(text=kind.upper())
+            self.error_warning_icon_label.image = None
+
+    def _center_error_warning_window(self) -> None:
+        if self.error_warning_window is None or not self.error_warning_window.winfo_exists():
+            return
+        width = max(self.error_warning_window.winfo_width(), self.error_warning_window.winfo_reqwidth(), 320)
+        height = max(self.error_warning_window.winfo_height(), self.error_warning_window.winfo_reqheight(), 240)
+        self._center_child_window(self.error_warning_window, width, height)
+
+    def _on_error_warning_window_configure(self, event: object) -> None:
+        if self.error_warning_message_label is None or not hasattr(event, "width"):
+            return
+        width = max(200, int(event.width) - 36)
+        self.error_warning_message_label.configure(wraplength=width)
+
+    def _close_error_warning_window(self) -> None:
+        if self.error_warning_window is not None and self.error_warning_window.winfo_exists():
+            self.error_warning_window.destroy()
+        self.error_warning_window = None
+        self.error_warning_title_label = None
+        self.error_warning_message_label = None
+        self.error_warning_icon_label = None
+        self.error_warning_ok_button = None
+
     def _run_dl1_task(
         self,
         *,
@@ -720,7 +852,7 @@ class DyingAudioApp(tk.Tk):
 
         def handle_error(exc: BaseException, details: str) -> None:
             self._append_log(details.rstrip())
-            messagebox.showerror(error_title, str(exc))
+            self._show_error_window(error_title, str(exc))
             self.status_var.set(error_title.replace(" failed", " failed."))
 
         def start_background_task() -> None:
@@ -920,7 +1052,7 @@ class DyingAudioApp(tk.Tk):
 
     def _warn_if_raw_entries_need_toolchain(self) -> None:
         if self._has_raw_entries() and self.current_toolchain is None:
-            messagebox.showwarning(
+            self._show_warning_window(
                 "DLDT toolchain required",
                 "This project includes raw audio. Saving or building it will require a valid DLDT toolchain path.",
             )
@@ -1155,7 +1287,7 @@ class DyingAudioApp(tk.Tk):
             sample_count = int(self.selected_sample_count_var.get() or 0)
             duration_ms = int(self.selected_duration_var.get() or 0)
         except ValueError:
-            messagebox.showerror(
+            self._show_error_window(
                 "Invalid entry values",
                 "Type, Samples @ 48k, and Duration (ms) must be whole numbers.",
             )
@@ -1309,7 +1441,7 @@ class DyingAudioApp(tk.Tk):
         try:
             metadata = probe_audio_metadata(selection)
         except Exception as exc:
-            messagebox.showerror("Replace audio failed", str(exc))
+            self._show_error_window("Replace audio failed", str(exc))
             self.status_var.set("Replace failed.")
             self._append_log(f"ERROR: {exc}")
             return
@@ -1544,7 +1676,7 @@ class DyingAudioApp(tk.Tk):
 
         cleaned_name = new_name.strip()
         if not cleaned_name:
-            messagebox.showerror("Rename entry", "Entry name cannot be empty.")
+            self._show_error_window("Rename entry", "Entry name cannot be empty.")
             return
 
         entry.entry_name = cleaned_name
@@ -1773,7 +1905,7 @@ class DyingAudioApp(tk.Tk):
         try:
             preview_path = self.preview_player.play_entry(entry, self._append_log)
         except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
+            self._show_error_window("Preview failed", str(exc))
             self.status_var.set("Preview failed.")
             self._append_log(f"ERROR: {exc}")
             return
@@ -1799,6 +1931,8 @@ class DyingAudioApp(tk.Tk):
         settings.dl1.last_output_folder = str(self.last_built_mod_root or "")
         if self.experimental_frame is not None:
             settings.experimental = self.experimental_frame.build_settings()
+        if self.other_frame is not None:
+            settings.other = self.other_frame.build_settings()
         save_settings(settings)
 
     def _build_mod(self) -> None:
@@ -1889,6 +2023,8 @@ class DyingAudioApp(tk.Tk):
         self.preview_player.close()
         if self.experimental_frame is not None:
             self.experimental_frame.shutdown()
+        if self.other_frame is not None:
+            self.other_frame.shutdown()
         self._cancel_preview_progress_updates()
         self._cleanup_edit_session()
         self.destroy()

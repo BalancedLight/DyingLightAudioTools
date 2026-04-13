@@ -135,3 +135,33 @@ def ffprobe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, str]
         return None
 
     return duration_seconds, stream_rate, "Metadata loaded via ffprobe."
+
+
+def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, int, str] | None:
+    if tools.vgmstream_path is None:
+        return None
+
+    source = Path(path).resolve()
+    command = [str(tools.vgmstream_path), "-m", str(source)]
+    result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.returncode != 0:
+        return None
+
+    sample_rate = 0
+    sample_count = 0
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("sample rate:"):
+            try:
+                sample_rate = int(line.split(":", 1)[1].strip().split()[0])
+            except (IndexError, ValueError):
+                sample_rate = 0
+        elif line.startswith("stream total samples:"):
+            try:
+                sample_count = int(line.split(":", 1)[1].strip().split()[0])
+            except (IndexError, ValueError):
+                sample_count = 0
+
+    if sample_rate <= 0 or sample_count <= 0:
+        return None
+    return sample_count / float(sample_rate), sample_rate, sample_count, "Metadata loaded via vgmstream."

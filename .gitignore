@@ -27,6 +27,12 @@ pip-wheel-metadata/
 .coverage.*
 htmlcov/
 tests/
+!tests/
+tests/*
+!tests/test_app.py
+!tests/test_settings.py
+!tests/test_pck_workspace.py
+!tests/test_other_workspace.py
 
 # Editor and OS files
 .DS_Store

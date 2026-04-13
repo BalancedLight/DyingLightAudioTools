@@ -15,6 +15,11 @@ from dyingaudio.models import AudioEntry
 
 WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+VGMSTREAM_RAW_SUFFIXES = {".wem"}
+
+
+def _raw_source_prefers_vgmstream(path: Path) -> bool:
+    return path.suffix.lower() in VGMSTREAM_RAW_SUFFIXES
 
 
 def preview_strategy_for_entry(entry: AudioEntry, environment: MediaTools) -> str:
@@ -26,6 +31,14 @@ def preview_strategy_for_entry(entry: AudioEntry, environment: MediaTools) -> st
     if entry.source_mode == "raw":
         if suffix == ".wav":
             return "Preview will play the WAV file directly."
+        if _raw_source_prefers_vgmstream(candidate):
+            if environment.vgmstream_path and environment.ffplay_path:
+                return "Preview will stream the selected Wwise audio through vgmstream into FFplay."
+            if environment.vgmstream_path:
+                return "Preview will decode the selected Wwise audio with vgmstream, then play it."
+            if environment.ffmpeg_path:
+                return "Preview will try to decode the selected Wwise audio to a temporary WAV, then play it."
+            return "Preview unavailable: vgmstream is required to preview Wwise .wem audio reliably."
         if environment.ffplay_path:
             return f"Preview will play the {suffix or 'raw audio'} file directly with FFplay."
         if environment.ffmpeg_path:
@@ -225,11 +238,85 @@ class PreviewPlayer:
             creationflags=WINDOWS_NO_WINDOW | WINDOWS_NEW_PROCESS_GROUP,
         )
 
+    def _decode_vgmstream_to_wav(self, source: Path, destination: Path, log: Callable[[str], None], *, label: str) -> Path:
+        if self.environment.vgmstream_path is None:
+            raise RuntimeError(f"vgmstream is required to decode {label}.")
+        command = [str(self.environment.vgmstream_path), "-o", str(destination), str(source)]
+        log(" ".join(command))
+        result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        if result.stdout.strip():
+            log(result.stdout.strip())
+        if result.stderr.strip():
+            log(result.stderr.strip())
+        if result.returncode != 0 or not destination.exists():
+            raise RuntimeError(f"Could not decode {label}.")
+        return destination
+
+    def _prepare_loose_source_wav(self, source: Path, log: Callable[[str], None]) -> Path:
+        if source.suffix.lower() == ".wav":
+            return source
+
+        entry = AudioEntry(entry_name=source.stem, source_mode="raw", source_path=str(source))
+        cache_key, destination = self._cached_destination(entry, source)
+        cached = self._cache.get(cache_key)
+        if cached is not None and cached.exists():
+            log(f"Using cached preview: {cached}")
+            return cached
+
+        if _raw_source_prefers_vgmstream(source):
+            decoded = self._decode_vgmstream_to_wav(source, destination, log, label=f"preview for '{source.name}'")
+            self._cache[cache_key] = decoded
+            return decoded
+
+        if self.environment.ffmpeg_path is None:
+            raise RuntimeError(f"FFmpeg is required to preview '{source.suffix or 'unknown'}' files.")
+        command = [
+            str(self.environment.ffmpeg_path),
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            str(destination),
+        ]
+        log(" ".join(command))
+        result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        if result.stdout.strip():
+            log(result.stdout.strip())
+        if result.stderr.strip():
+            log(result.stderr.strip())
+        if result.returncode != 0 or not destination.exists():
+            raise RuntimeError(f"Could not decode preview for '{source.name}'.")
+        self._cache[cache_key] = destination
+        return destination
+
     def _start_fast_preview(self, entry: AudioEntry, log: Callable[[str], None]) -> bool:
         if entry.source_mode == "raw":
             source = entry.resolved_source_path()
             if source is None or not source.exists():
                 raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
+            if _raw_source_prefers_vgmstream(source):
+                if self.environment.vgmstream_path is None or self.environment.ffplay_path is None:
+                    return False
+                decode_command = [str(self.environment.vgmstream_path), "-p", str(source)]
+                log(" ".join(decode_command))
+                self._decoder_process = subprocess.Popen(
+                    decode_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=WINDOWS_NO_WINDOW | WINDOWS_NEW_PROCESS_GROUP,
+                )
+                assert self._decoder_process.stdout is not None
+                self._player_process = self._spawn_ffplay("-", stdin=self._decoder_process.stdout)
+                self._decoder_process.stdout.close()
+                time.sleep(0.08)
+                if self._decoder_process.poll() not in (None, 0):
+                    self.stop()
+                    return False
+                self._current_path = source
+                self._playback_kind = "process"
+                log(f"Fast preview: streaming {entry.entry_name} through vgmstream + FFplay")
+                return True
             if self.environment.ffplay_path is None:
                 return False
             self._player_process = self._spawn_ffplay(source)
@@ -298,8 +385,9 @@ class PreviewPlayer:
         if self.environment.ffmpeg_path is None:
             raise RuntimeError("FFmpeg is required to mix multiple audio sources.")
 
+        prepared_sources = [self._prepare_loose_source_wav(source, log) for source in sources]
         command = [str(self.environment.ffmpeg_path), "-y", "-loglevel", "error"]
-        for source in sources:
+        for source in prepared_sources:
             command.extend(["-i", str(source)])
         input_labels = "".join(f"[{index}:a]" for index in range(len(sources)))
         filter_complex = f"{input_labels}amix=inputs={len(sources)}:duration=first:dropout_transition=0[mix]"
@@ -340,34 +428,7 @@ class PreviewPlayer:
             if source is None or not source.exists():
                 raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
 
-            if source.suffix.lower() == ".wav":
-                return source
-            if self.environment.ffmpeg_path is None:
-                raise RuntimeError(f"FFmpeg is required to preview '{source.suffix or 'unknown'}' files.")
-            cache_key, destination = self._cached_destination(entry, source)
-            cached = self._cache.get(cache_key)
-            if cached is not None and cached.exists():
-                log(f"Using cached preview: {cached}")
-                return cached
-            command = [
-                str(self.environment.ffmpeg_path),
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(source),
-                str(destination),
-            ]
-            log(" ".join(command))
-            result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-            if result.stdout.strip():
-                log(result.stdout.strip())
-            if result.stderr.strip():
-                log(result.stderr.strip())
-            if result.returncode != 0 or not destination.exists():
-                raise RuntimeError(f"Could not decode preview for '{entry.entry_name}'.")
-            self._cache[cache_key] = destination
-            return destination
+            return self._prepare_loose_source_wav(source, log)
 
         fsb_path = entry.resolved_fsb_path()
         if fsb_path is None or not fsb_path.exists():
@@ -380,14 +441,6 @@ class PreviewPlayer:
         if cached is not None and cached.exists():
             log(f"Using cached preview: {cached}")
             return cached
-        command = [str(self.environment.vgmstream_path), "-o", str(destination), str(fsb_path)]
-        log(" ".join(command))
-        result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-        if result.stdout.strip():
-            log(result.stdout.strip())
-        if result.stderr.strip():
-            log(result.stderr.strip())
-        if result.returncode != 0 or not destination.exists():
-            raise RuntimeError(f"Could not decode FSB preview for '{entry.entry_name}'.")
-        self._cache[cache_key] = destination
-        return destination
+        decoded = self._decode_vgmstream_to_wav(fsb_path, destination, log, label=f"FSB preview for '{entry.entry_name}'")
+        self._cache[cache_key] = decoded
+        return decoded

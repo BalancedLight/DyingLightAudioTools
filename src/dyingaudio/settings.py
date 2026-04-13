@@ -20,6 +20,8 @@ DEFAULT_BUNDLE_NAME = "workshop_audio"
 DEFAULT_EXPERIMENTAL_GAME = "DLTB"
 DEFAULT_EXPERIMENTAL_ARCHIVE_SET = "base"
 DEFAULT_EXPERIMENTAL_CACHE_ROOT = str(Path(os.environ.get("LOCALAPPDATA", "")) / "DyingAudio" / "wwise_cache")
+DEFAULT_OTHER_SOURCE_TYPE = "Wwise PCK (AKPK)"
+DEFAULT_OTHER_CACHE_ROOT = str(Path(os.environ.get("LOCALAPPDATA", "")) / "DyingAudio" / "other_pck_cache")
 STEAM_COMMON_SUBPATH = Path("steamapps") / "common"
 GAME_INSTALL_NAMES = {
     "DL1": "Dying Light",
@@ -76,9 +78,18 @@ class ExperimentalSettings:
 
 
 @dataclass(slots=True)
+class OtherSettings:
+    selected_source_type: str = DEFAULT_OTHER_SOURCE_TYPE
+    root: str = ""
+    cache_root: str = DEFAULT_OTHER_CACHE_ROOT
+    last_export_folder: str = ""
+
+
+@dataclass(slots=True)
 class AppSettings:
     dl1: DL1Settings = field(default_factory=DL1Settings)
     experimental: ExperimentalSettings = field(default_factory=ExperimentalSettings)
+    other: OtherSettings = field(default_factory=OtherSettings)
 
     # Compatibility accessors for the existing DL1 workspace.
     @property
@@ -261,7 +272,7 @@ def load_settings() -> AppSettings:
     except (OSError, json.JSONDecodeError):
         return AppSettings()
 
-    if "dl1" not in payload and "experimental" not in payload:
+    if "dl1" not in payload and "experimental" not in payload and "other" not in payload:
         return _migrate_legacy_settings(payload)
 
     settings = AppSettings()
@@ -269,6 +280,8 @@ def load_settings() -> AppSettings:
         settings.dl1 = _update_dataclass(settings.dl1, payload["dl1"])
     if isinstance(payload.get("experimental"), dict):
         settings.experimental = _update_dataclass(settings.experimental, payload["experimental"])
+    if isinstance(payload.get("other"), dict):
+        settings.other = _update_dataclass(settings.other, payload["other"])
 
     if not settings.dl1.audio_proc_names:
         settings.dl1.audio_proc_names = list(DEFAULT_AUDIO_PROCS)
@@ -278,6 +291,10 @@ def load_settings() -> AppSettings:
         settings.experimental.archive_set = DEFAULT_EXPERIMENTAL_ARCHIVE_SET
     if not settings.experimental.selected_game:
         settings.experimental.selected_game = DEFAULT_EXPERIMENTAL_GAME
+    if not settings.other.cache_root:
+        settings.other.cache_root = DEFAULT_OTHER_CACHE_ROOT
+    if not settings.other.selected_source_type:
+        settings.other.selected_source_type = DEFAULT_OTHER_SOURCE_TYPE
     return settings
 
 

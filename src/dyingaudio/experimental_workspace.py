@@ -163,8 +163,9 @@ def filter_and_sort_media_rows(
 
 
 class ExperimentalWwiseFrame(ttk.Frame):
-    def __init__(self, parent: tk.Misc, settings: ExperimentalSettings) -> None:
+    def __init__(self, parent: tk.Misc, settings: ExperimentalSettings, app: tk.Tk) -> None:
         super().__init__(parent)
+        self.app = app
         self.preview_player = PreviewPlayer()
         self.workspace: WwiseWorkspace | None = None
         self.available_archive_sets: list[ArchiveSetDescriptor] = []
@@ -211,6 +212,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self._media_render_state: MediaRenderState | None = None
         self.content_paned: ttk.Panedwindow | None = None
         self._pane_layout_initialized = False
+        self._pane_layout_after_ids: list[str] = []
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -241,6 +243,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.task_runner.cancel_polling()
         self._close_loading_window()
         self._cancel_media_render()
+        self._cancel_pane_layout_callbacks()
         self.preview_player.close()
 
     def _build_ui(self) -> None:
@@ -429,14 +432,22 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self.export_bank_button,
             self.export_dump_button,
         ]
-        self.after_idle(self._ensure_default_pane_layout)
-        self.after(100, self._ensure_default_pane_layout)
-        self.after(500, self._ensure_default_pane_layout)
+        self._pane_layout_after_ids.append(self.after_idle(self._ensure_default_pane_layout))
+        self._pane_layout_after_ids.append(self.after(100, self._ensure_default_pane_layout))
+        self._pane_layout_after_ids.append(self.after(500, self._ensure_default_pane_layout))
         self.bind("<Configure>", self._on_frame_configure)
         self.bind("<Visibility>", self._on_frame_configure, add="+")
 
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def _cancel_pane_layout_callbacks(self) -> None:
+        for after_id in self._pane_layout_after_ids:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._pane_layout_after_ids.clear()
 
     def _cancel_loading_animation(self) -> None:
         if self._loading_gif_after_id is None:
@@ -671,7 +682,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 self.task_status_var.set("Cancelled.")
                 return
             self._set_text_widget(self.logs_text, details)
-            messagebox.showerror(error_title, str(exc))
+            self.app._show_error_window(error_title, str(exc))
             self._append_status(error_title.replace(" failed", " failed."))
 
         self.task_runner.start(
@@ -1307,7 +1318,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         try:
             preview_path = self.preview_player.play_entry(entry, self._append_status)
         except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
+            self.app._show_error_window("Preview failed", str(exc))
             self._append_status("Experimental preview failed.")
             return
         self._append_status(f"Previewing {preview_path.name}.")
@@ -1321,14 +1332,14 @@ class ExperimentalWwiseFrame(ttk.Frame):
             )
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            messagebox.showerror("Preview failed", "FFmpeg is required to mix multiple audio files together.")
+            self.app._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
         sources = [row.source if row.source.exists() else row.link for row in rows]
         try:
             preview_path = self.preview_player.play_combined_sources(sources, self._append_status)
         except Exception as exc:
-            messagebox.showerror("Preview failed", str(exc))
+            self.app._show_error_window("Preview failed", str(exc))
             self._append_status("Experimental group preview failed.")
             return
         self._append_status(f"Previewing {len(rows)} files together from {preview_path.name}.")
@@ -1342,7 +1353,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             )
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            messagebox.showerror("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
+            self.app._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
         destination_root = self._ask_export_directory("Export mixed audio")
