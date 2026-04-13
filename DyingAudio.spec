@@ -2,8 +2,16 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks.tcl_tk import tcltk_info
+
 project_root = Path.cwd()
 src_root = project_root / "src"
+
+if not tcltk_info.available:
+    raise SystemExit(
+        "PyInstaller could not discover Tcl/Tk data for this build environment. "
+        "Build with a standard Windows Python installation that includes working tkinter/Tcl/Tk files."
+    )
 
 block_cipher = None
 
@@ -13,8 +21,14 @@ a = Analysis(
     binaries=[],
     datas=[
         (str(project_root / "assets" / "dyinglight_devtools.ico"), "assets"),
+        *[(src, dest) for dest, src, _typecode in tcltk_info.data_files],
     ],
-    hiddenimports=[],
+    hiddenimports=[
+        "tkinter",
+        "tkinter.filedialog",
+        "tkinter.ttk",
+        "tkinter.scrolledtext",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

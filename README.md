@@ -69,6 +69,8 @@ After installing PyInstaller:
 pwsh -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 ```
 
+> The build requires a Windows Python installation with Tcl/Tk support so `tkinter` can be packaged correctly.
+
 ## Notes
 
 - Default experimental cache root: `%LOCALAPPDATA%\DyingAudio\wwise_cache`

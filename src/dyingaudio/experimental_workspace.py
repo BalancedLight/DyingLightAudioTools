@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
@@ -29,6 +30,7 @@ from dyingaudio.core.wwise_workspace import (
     workspace_details_text,
 )
 from dyingaudio.models import AudioEntry
+from dyingaudio.popups import ask_yes_no_dialog, show_error_dialog, show_info_dialog
 from dyingaudio.settings import (
     DEFAULT_EXPERIMENTAL_ARCHIVE_SET,
     DEFAULT_EXPERIMENTAL_CACHE_ROOT,
@@ -163,9 +165,9 @@ def filter_and_sort_media_rows(
 
 
 class ExperimentalWwiseFrame(ttk.Frame):
-    def __init__(self, parent: tk.Misc, settings: ExperimentalSettings, app: tk.Tk) -> None:
+    def __init__(self, parent: tk.Misc, settings: ExperimentalSettings, app: tk.Tk | None = None) -> None:
         super().__init__(parent)
-        self.app = app
+        self.app = app if app is not None else self.winfo_toplevel()
         self.preview_player = PreviewPlayer()
         self.workspace: WwiseWorkspace | None = None
         self.available_archive_sets: list[ArchiveSetDescriptor] = []
@@ -196,7 +198,6 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.task_progress_var = tk.DoubleVar(value=0.0)
         self.task_runner = BackgroundTaskRunner(self)
         self._busy_widgets: list[tk.Widget] = []
-        self.task_progress: ttk.Progressbar | None = None
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
         self.loading_progress: ttk.Progressbar | None = None
@@ -266,6 +267,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.game_root_browse_button.grid(row=0, column=6, sticky="ew", padx=6, pady=6)
         self.open_cache_button = ttk.Button(controls, text="Open Cache Folder", command=self._open_cache_folder)
         self.open_cache_button.grid(row=0, column=7, sticky="ew", padx=6, pady=6)
+        self.clear_cache_button = ttk.Button(controls, text="Clear Cache", command=self._clear_cache)
+        self.clear_cache_button.grid(row=0, column=8, sticky="ew", padx=6, pady=6)
 
         ttk.Label(controls, text="Archive Set").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.archive_set_combo = ttk.Combobox(controls, textvariable=self.archive_set_var, state="readonly")
@@ -441,6 +444,26 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
 
+    def _show_info_window(self, title: str, message: str) -> None:
+        show_info = getattr(self.app, "_show_info_window", None)
+        if callable(show_info):
+            show_info(title, message)
+            return
+        show_info_dialog(self, title, message)
+
+    def _ask_yes_no_window(self, title: str, message: str, *, kind: str = "warning") -> bool:
+        ask_yes_no = getattr(self.app, "_ask_yes_no_window", None)
+        if callable(ask_yes_no):
+            return ask_yes_no(title, message, kind=kind)
+        return ask_yes_no_dialog(self, title, message, kind=kind)
+
+    def _show_error_window(self, title: str, message: str) -> None:
+        show_error = getattr(self.app, "_show_error_window", None)
+        if callable(show_error):
+            show_error(title, message)
+            return
+        show_error_dialog(self, title, message)
+
     def _cancel_pane_layout_callbacks(self) -> None:
         for after_id in self._pane_layout_after_ids:
             try:
@@ -464,11 +487,18 @@ class ExperimentalWwiseFrame(ttk.Frame):
             return
         frame = self._load_loading_gif_frame(self._loading_gif_frame_index)
         if frame is None:
-            self.loading_gif_label.configure(text="Working...")
-            self.loading_gif_label.image = None
+            try:
+                self.loading_gif_label.configure(text="Working...")
+                self.loading_gif_label.image = None
+            except tk.TclError:
+                self._close_loading_window()
             return
-        self.loading_gif_label.configure(image=frame)
-        self.loading_gif_label.image = frame
+        try:
+            self.loading_gif_label.configure(image=frame)
+            self.loading_gif_label.image = frame
+        except tk.TclError:
+            self._close_loading_window()
+            return
         next_index = self._loading_gif_frame_index + 1
         if self._load_loading_gif_frame(next_index) is None:
             next_index = 0
@@ -632,21 +662,21 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _apply_task_progress(self, progress: TaskProgress) -> None:
         self.task_status_var.set(progress.message or "Working...")
-        if self.task_progress is None:
+        if self.loading_progress is None:
             return
         if progress.is_determinate:
-            self.task_progress.stop()
-            self.task_progress.configure(mode="determinate")
+            self.loading_progress.stop()
+            self.loading_progress.configure(mode="determinate")
             self.task_progress_var.set(progress.percent)
         else:
             self.task_progress_var.set(0.0)
-            self.task_progress.configure(mode="indeterminate")
-            self.task_progress.start(15)
+            self.loading_progress.configure(mode="indeterminate")
+            self.loading_progress.start(15)
 
     def _finish_task_ui(self) -> None:
-        if self.task_progress is not None:
-            self.task_progress.stop()
-            self.task_progress.configure(mode="determinate")
+        if self.loading_progress is not None:
+            self.loading_progress.stop()
+            self.loading_progress.configure(mode="determinate")
         self.task_progress_var.set(0.0)
         self._close_loading_window()
         self._set_task_busy(False)
@@ -667,7 +697,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         on_success: callable,
     ) -> None:
         if self.task_runner.is_running:
-            messagebox.showinfo("Experimental workspace busy", "Wait for the current experimental task to finish first.")
+            self._show_info_window("Experimental workspace busy", "Wait for the current experimental task to finish first.")
             return
         self._set_task_busy(True)
         self.task_status_var.set(start_message)
@@ -682,7 +712,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 self.task_status_var.set("Cancelled.")
                 return
             self._set_text_widget(self.logs_text, details)
-            self.app._show_error_window(error_title, str(exc))
+            self._show_error_window(error_title, str(exc))
             self._append_status(error_title.replace(" failed", " failed."))
 
         self.task_runner.start(
@@ -825,6 +855,62 @@ class ExperimentalWwiseFrame(ttk.Frame):
         target.mkdir(parents=True, exist_ok=True)
         os.startfile(str(target))
 
+    def _clear_cache(self) -> None:
+        if self.task_runner.is_running:
+            self._show_info_window("Clear cache", "Wait for the current experimental workspace task to finish first.")
+            return
+
+        target = self._resolve_cache_root()
+        if not target.exists() and self.workspace is None:
+            self._show_info_window("Clear cache", "The experimental cache is already empty.")
+            return
+
+        game = self.game_var.get().strip() or DEFAULT_EXPERIMENTAL_GAME
+        archive_set = self.archive_set_var.get().strip() or DEFAULT_EXPERIMENTAL_ARCHIVE_SET
+        prompt = (
+            f"Delete the experimental cache at:\n{target}\n\n"
+            f"This will remove the current {game_label(game)} / {archive_set} workspace cache and clear the loaded browser data."
+        )
+        if not self._ask_yes_no_window("Clear cache", prompt):
+            return
+
+        self.preview_player.stop()
+
+        def worker(progress, log):
+            progress("Clearing experimental cache...")
+            log(f"Clearing experimental cache: {target}")
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=False)
+            return target
+
+        def on_success(result: object) -> None:
+            cleared_target = result if isinstance(result, Path) else target
+            self.preview_player.clear_cache()
+            self.workspace = None
+            self.tree_node_context.clear()
+            self.visible_rows = []
+            self.browser_tree.delete(*self.browser_tree.get_children())
+            self._cancel_media_render()
+            self.media_tree.delete(*self.media_tree.get_children())
+            self.media_iid_rows.clear()
+            self.media_group_iids.clear()
+            self.workspace_var.set("Workspace: none")
+            self.selection_var.set("Select an archive, bank, or event to browse media.")
+            self.details_var.set("No media selected.")
+            self.media_count_var.set("0 shown / 0 total")
+            self.task_status_var.set("Experimental cache cleared.")
+            self._set_text_widget(self.details_text, "")
+            self._set_text_widget(self.logs_text, "No experimental workspace loaded.")
+            self._update_preview_action_controls()
+            self._append_status(f"Cleared experimental cache: {cleared_target}")
+
+        self._run_task(
+            start_message="Clearing experimental cache...",
+            error_title="Clear cache failed",
+            worker=worker,
+            on_success=on_success,
+        )
+
     def _refresh_archive_set_choices(self) -> None:
         game = self.game_var.get().strip() or DEFAULT_EXPERIMENTAL_GAME
         install_root = self.install_root_var.get().strip()
@@ -847,10 +933,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         game = self.game_var.get().strip() or DEFAULT_EXPERIMENTAL_GAME
         install_root_path = self._resolve_game_root(game, allow_discovery=True)
         if install_root_path is None:
-            messagebox.showinfo(
-                "Build workspace",
-                f"Select the {game_label(game)} install folder first, or click Browse to auto-find it.",
-            )
+            self._show_info_window("Build workspace", f"Select the {game_label(game)} install folder first, or click Browse to auto-find it.")
             return
         if self.install_root_var.get().strip() != str(install_root_path):
             self.install_root_var.set(str(install_root_path))
@@ -1313,12 +1396,12 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _play_selected(self) -> None:
         entry = self._selected_preview_entry()
         if entry is None:
-            messagebox.showinfo("Preview media", "Select a media row to preview first.")
+            self._show_info_window("Preview media", "Select a media row to preview first.")
             return
         try:
             preview_path = self.preview_player.play_entry(entry, self._append_status)
         except Exception as exc:
-            self.app._show_error_window("Preview failed", str(exc))
+            self._show_error_window("Preview failed", str(exc))
             self._append_status("Experimental preview failed.")
             return
         self._append_status(f"Previewing {preview_path.name}.")
@@ -1326,20 +1409,20 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _play_selected_together(self) -> None:
         rows = self._selected_group_preview_rows()
         if len(rows) < 2:
-            messagebox.showinfo(
+            self._show_info_window(
                 "Preview media",
                 "Select two or more matching media rows with the same duration and sample count first.",
             )
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            self.app._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
+            self._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
         sources = [row.source if row.source.exists() else row.link for row in rows]
         try:
             preview_path = self.preview_player.play_combined_sources(sources, self._append_status)
         except Exception as exc:
-            self.app._show_error_window("Preview failed", str(exc))
+            self._show_error_window("Preview failed", str(exc))
             self._append_status("Experimental group preview failed.")
             return
         self._append_status(f"Previewing {len(rows)} files together from {preview_path.name}.")
@@ -1347,13 +1430,13 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _export_selected_media_mixed(self) -> None:
         rows = self._selected_group_preview_rows()
         if len(rows) < 2:
-            messagebox.showinfo(
+            self._show_info_window(
                 "Export mixed audio",
                 "Select two or more matching media rows with the same duration and sample count first.",
             )
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            self.app._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
+            self._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
         destination_root = self._ask_export_directory("Export mixed audio")
@@ -1386,7 +1469,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _export_selected_media(self) -> None:
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Export selected media", "Select one or more media rows first.")
+            self._show_info_window("Export selected media", "Select one or more media rows first.")
             return
         destination = self._ask_export_directory("Export selected media")
         if destination is None:
@@ -1413,15 +1496,15 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _export_selected_event(self) -> None:
         if self.workspace is None:
-            messagebox.showinfo("Export selected event", "Build the experimental workspace first.")
+            self._show_info_window("Export selected event", "Build the experimental workspace first.")
             return
         context = self._selected_context()
         if context is None:
-            messagebox.showinfo("Export selected event", "Select an event first.")
+            self._show_info_window("Export selected event", "Select an event first.")
             return
         node_type, archive, bank, event = context
         if node_type != "event":
-            messagebox.showinfo("Export selected event", "Select a specific event in the left tree first.")
+            self._show_info_window("Export selected event", "Select a specific event in the left tree first.")
             return
         destination = self._ask_export_directory("Export selected event folder")
         if destination is None:
@@ -1443,15 +1526,15 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _export_selected_bank_files(self) -> None:
         if self.workspace is None:
-            messagebox.showinfo("Export selected bank files", "Build the experimental workspace first.")
+            self._show_info_window("Export selected bank files", "Build the experimental workspace first.")
             return
         context = self._selected_context()
         if context is None:
-            messagebox.showinfo("Export selected bank files", "Select a bank or event first.")
+            self._show_info_window("Export selected bank files", "Select a bank or event first.")
             return
         _node_type, _archive, bank, _event = context
         if not bank:
-            messagebox.showinfo("Export selected bank files", "Select a bank or event first.")
+            self._show_info_window("Export selected bank files", "Select a bank or event first.")
             return
         destination = self._ask_export_directory("Export selected bank files")
         if destination is None:
@@ -1459,7 +1542,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         def on_success(result: object) -> None:
             exported = result if isinstance(result, list) else []
             if not exported:
-                messagebox.showinfo("Export selected bank files", f"No extracted .bnk files were found for '{bank}'.")
+                self._show_info_window("Export selected bank files", f"No extracted .bnk files were found for '{bank}'.")
                 return
             self._append_status(f"Exported {len(exported)} bank file(s) for '{bank}' to {destination}.")
 
@@ -1478,7 +1561,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _export_workspace_dump(self) -> None:
         if self.workspace is None:
-            messagebox.showinfo("Export workspace dump", "Build the experimental workspace first.")
+            self._show_info_window("Export workspace dump", "Build the experimental workspace first.")
             return
         destination = self._ask_export_directory("Export experimental workspace dump")
         if destination is None:

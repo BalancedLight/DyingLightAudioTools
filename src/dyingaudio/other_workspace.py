@@ -1,27 +1,39 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
+from dyingaudio.audio_info import probe_audio_metadata
+from dyingaudio.core.media_tools import (
+    COMMON_AUDIO_FILETYPES,
+    convert_audio_to_wem,
+    discover_media_tools,
+    ensure_portable_tool_layout,
+    missing_wem_conversion_requirements,
+)
 from dyingaudio.core.pck_workspace import (
     AKPK_SOURCE_TYPE,
     PckAudioRow,
+    PckAudioReplacementResult,
     PckPackDescriptor,
     PckPackRows,
     PckWorkspaceIndex,
     export_pck_media_rows,
     load_pck_pack_rows,
+    replace_pck_audio_row,
     scan_pck_root,
     workspace_details_text,
 )
 from dyingaudio.core.preview import PreviewPlayer
 from dyingaudio.models import AudioEntry
+from dyingaudio.popups import ask_yes_no_dialog, show_error_dialog, show_info_dialog, show_warning_dialog
 from dyingaudio.settings import (
     DEFAULT_OTHER_CACHE_ROOT,
     DEFAULT_OTHER_SOURCE_TYPE,
@@ -145,9 +157,9 @@ def filter_and_sort_pck_rows(
 
 
 class OtherWorkspaceFrame(ttk.Frame):
-    def __init__(self, parent: tk.Misc, settings: OtherSettings, app: tk.Tk) -> None:
+    def __init__(self, parent: tk.Misc, settings: OtherSettings, app: tk.Tk | None = None) -> None:
         super().__init__(parent)
-        self.app = app
+        self.app = app if app is not None else self.winfo_toplevel()
         self.preview_player = PreviewPlayer()
         self.index: PckWorkspaceIndex | None = None
         self.pack_rows_cache: dict[str, PckPackRows] = {}
@@ -157,6 +169,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.media_iid_rows: dict[str, list[PckAudioRow]] = {}
         self.media_group_iids: set[str] = set()
         self.task_runner = BackgroundTaskRunner(self)
+        self._ui_busy = False
         self._busy_widgets: list[tk.Widget] = []
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
@@ -170,12 +183,16 @@ class OtherWorkspaceFrame(ttk.Frame):
         self._media_render_after_id: str | None = None
         self._media_render_state: PckMediaRenderState | None = None
         self._pack_select_after_id: str | None = None
+        self._pending_pack_after_id: str | None = None
+        self._pending_pack_relative_path: str | None = None
         self.content_paned: ttk.Panedwindow | None = None
         self._pane_layout_initialized = False
         self._pane_layout_after_ids: list[str] = []
+        self._replace_toggle_sync = False
         self._last_export_folder_value = settings.last_export_folder
 
         self.source_type_var = tk.StringVar(value=settings.selected_source_type or DEFAULT_OTHER_SOURCE_TYPE)
+        self.enable_replace_audio_var = tk.BooleanVar(value=False)
         self.root_var = tk.StringVar(value=settings.root)
         self.cache_root_var = tk.StringVar(value=settings.cache_root or DEFAULT_OTHER_CACHE_ROOT)
         self.status_var = tk.StringVar(value="Other workspace idle.")
@@ -196,11 +213,13 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.rowconfigure(1, weight=1)
         self._build_ui()
 
+        self.source_type_var.trace_add("write", self._on_source_type_changed)
         self.media_search_var.trace_add("write", self._on_media_filter_changed)
         self.media_sort_field_var.trace_add("write", self._on_media_filter_changed)
         self.media_sort_descending_var.trace_add("write", self._on_media_filter_changed)
         self.group_similar_var.trace_add("write", self._on_media_filter_changed)
         self._update_media_sort_controls()
+        self._update_replace_controls()
 
     def build_settings(self) -> OtherSettings:
         return OtherSettings(
@@ -219,14 +238,21 @@ class OtherWorkspaceFrame(ttk.Frame):
             except tk.TclError:
                 pass
             self._pack_select_after_id = None
+        if self._pending_pack_after_id is not None:
+            try:
+                self.after_cancel(self._pending_pack_after_id)
+            except tk.TclError:
+                pass
+            self._pending_pack_after_id = None
         self._cancel_pane_layout_callbacks()
         self._cancel_media_render()
+        self._close_loading_window()
         self.preview_player.close()
 
     def _build_ui(self) -> None:
         controls = ttk.LabelFrame(self, text="Other Workspace")
         controls.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
-        for column in range(9):
+        for column in range(10):
             controls.columnconfigure(column, weight=1)
 
         ttk.Label(controls, text="Source Type").grid(row=0, column=0, sticky="w", padx=6, pady=6)
@@ -245,6 +271,8 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.root_browse_button.grid(row=0, column=6, sticky="ew", padx=6, pady=6)
         self.open_cache_button = ttk.Button(controls, text="Open Cache Folder", command=self._open_cache_folder)
         self.open_cache_button.grid(row=0, column=7, sticky="ew", padx=6, pady=6)
+        self.clear_cache_button = ttk.Button(controls, text="Clear Cache", command=self._clear_cache)
+        self.clear_cache_button.grid(row=0, column=8, sticky="ew", padx=6, pady=6)
 
         ttk.Label(controls, text="Cache Root").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.cache_root_entry = ttk.Entry(controls, textvariable=self.cache_root_var)
@@ -256,9 +284,17 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.cancel_task_button = ttk.Button(controls, text="Cancel", command=self._cancel_task, state="disabled")
         self.cancel_task_button.grid(row=1, column=6, sticky="ew", padx=6, pady=6)
 
-        ttk.Label(controls, textvariable=self.workspace_var).grid(row=2, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
-        ttk.Label(controls, textvariable=self.preview_tools_var).grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
-        ttk.Label(controls, textvariable=self.task_status_var).grid(row=4, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
+        self.enable_replace_audio_checkbutton = ttk.Checkbutton(
+            controls,
+            text="Enable experimental AKPK audio replacement",
+            variable=self.enable_replace_audio_var,
+            command=self._on_replace_toggle_changed,
+        )
+        self.enable_replace_audio_checkbutton.grid(row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 4))
+
+        ttk.Label(controls, textvariable=self.workspace_var).grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(controls, textvariable=self.preview_tools_var).grid(row=4, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
+        ttk.Label(controls, textvariable=self.task_status_var).grid(row=5, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
 
         content = ttk.Panedwindow(self, orient="horizontal")
         content.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
@@ -349,6 +385,8 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.media_tree.configure(xscrollcommand=media_scroll_x.set)
 
         self.media_context_menu = tk.Menu(self, tearoff=False)
+        self.media_context_menu.add_command(label="Replace Selected Audio...", command=self._replace_selected_media)
+        self.media_context_menu.add_separator()
         self.media_context_menu.add_command(label="Export Selected Media...", command=self._export_selected_media)
         self.media_context_menu.add_command(label="Export Mixed Audio...", command=self._export_selected_media_mixed)
         self.media_tree.bind("<Button-3>", self._show_media_context_menu)
@@ -356,12 +394,19 @@ class OtherWorkspaceFrame(ttk.Frame):
 
         center_actions = ttk.Frame(center)
         center_actions.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
-        for column in range(2):
+        for column in range(3):
             center_actions.columnconfigure(column, weight=1)
         self.export_media_button = ttk.Button(center_actions, text="Export Selected Media", command=self._export_selected_media)
         self.export_media_button.grid(row=0, column=0, sticky="ew", padx=2)
         self.export_mixed_button = ttk.Button(center_actions, text="Export Mixed Audio", command=self._export_selected_media_mixed)
         self.export_mixed_button.grid(row=0, column=1, sticky="ew", padx=2)
+        self.replace_audio_button = ttk.Button(
+            center_actions,
+            text="Replace Selected Audio",
+            command=self._replace_selected_media,
+            state="disabled",
+        )
+        self.replace_audio_button.grid(row=0, column=2, sticky="ew", padx=2)
 
         preview_tab = ttk.Frame(right, padding=6)
         preview_tab.columnconfigure(0, weight=1)
@@ -401,8 +446,10 @@ class OtherWorkspaceFrame(ttk.Frame):
             self.media_search_entry,
             self.media_sort_combo,
             self.media_sort_order_button,
+            self.enable_replace_audio_checkbutton,
             self.export_media_button,
             self.export_mixed_button,
+            self.replace_audio_button,
             self.play_button,
             self.stop_button,
         ]
@@ -415,6 +462,100 @@ class OtherWorkspaceFrame(ttk.Frame):
 
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def _show_info_window(self, title: str, message: str) -> None:
+        show_info = getattr(self.app, "_show_info_window", None)
+        if callable(show_info):
+            show_info(title, message)
+            return
+        show_info_dialog(self, title, message)
+
+    def _show_warning_window(self, title: str, message: str) -> None:
+        show_warning = getattr(self.app, "_show_warning_window", None)
+        if callable(show_warning):
+            show_warning(title, message)
+            return
+        show_warning_dialog(self, title, message)
+
+    def _show_error_window(self, title: str, message: str) -> None:
+        show_error = getattr(self.app, "_show_error_window", None)
+        if callable(show_error):
+            show_error(title, message)
+            return
+        show_error_dialog(self, title, message)
+
+    def _ask_yes_no_window(self, title: str, message: str, *, kind: str = "warning") -> bool:
+        ask_yes_no = getattr(self.app, "_ask_yes_no_window", None)
+        if callable(ask_yes_no):
+            return ask_yes_no(title, message, kind=kind)
+        return ask_yes_no_dialog(self, title, message, kind=kind)
+
+    def _source_type_supports_replacement(self) -> bool:
+        return self.source_type_var.get().strip() == AKPK_SOURCE_TYPE
+
+    def _on_source_type_changed(self, *_args: object) -> None:
+        if not self._source_type_supports_replacement() and self.enable_replace_audio_var.get():
+            self._replace_toggle_sync = True
+            try:
+                self.enable_replace_audio_var.set(False)
+            finally:
+                self._replace_toggle_sync = False
+        self._update_replace_controls()
+
+    def _set_replace_toggle(self, value: bool) -> None:
+        self._replace_toggle_sync = True
+        try:
+            self.enable_replace_audio_var.set(value)
+        finally:
+            self._replace_toggle_sync = False
+
+    def _on_replace_toggle_changed(self) -> None:
+        if self._replace_toggle_sync:
+            return
+        enabled = self.enable_replace_audio_var.get()
+        if enabled and self._source_type_supports_replacement():
+            confirmed = self._ask_yes_no_window(
+                "Experimental PCK replacement",
+                (
+                    "AKPK audio replacement is experimental and may cause errors in certain games.\n\n"
+                    "This feature edits the selected .pck file directly and creates a .bak backup before the first change.\n\n"
+                    "Enable replacement mode?"
+                ),
+                kind="warning",
+            )
+            if not confirmed:
+                self._set_replace_toggle(False)
+                self._append_status("Experimental AKPK replacement left disabled.")
+                self._update_replace_controls()
+                return
+            self._append_status("Experimental AKPK replacement enabled.")
+        elif not enabled:
+            self._append_status("Experimental AKPK replacement disabled.")
+        self._update_replace_controls()
+
+    def _selected_replaceable_row(self) -> PckAudioRow | None:
+        selection = list(self.media_tree.selection())
+        if len(selection) != 1:
+            return None
+        selected_iid = selection[0]
+        if selected_iid in self.media_group_iids:
+            return None
+        rows = self.media_iid_rows.get(selected_iid, [])
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
+    def _can_replace_selected_audio(self) -> bool:
+        if not self._source_type_supports_replacement():
+            return False
+        if self._ui_busy or self.task_runner.is_running or not self.enable_replace_audio_var.get():
+            return False
+        return self._selected_replaceable_row() is not None
+
+    def _update_replace_controls(self) -> None:
+        toggle_state = "normal" if self._source_type_supports_replacement() and not self.task_runner.is_running else "disabled"
+        self.enable_replace_audio_checkbutton.configure(state=toggle_state)
+        self.replace_audio_button.configure(state="normal" if self._can_replace_selected_audio() else "disabled")
 
     def _cancel_pane_layout_callbacks(self) -> None:
         for after_id in self._pane_layout_after_ids:
@@ -498,11 +639,18 @@ class OtherWorkspaceFrame(ttk.Frame):
             return
         frame = self._load_loading_gif_frame(self._loading_gif_frame_index)
         if frame is None:
-            self.loading_gif_label.configure(text="Working...")
-            self.loading_gif_label.image = None
+            try:
+                self.loading_gif_label.configure(text="Working...")
+                self.loading_gif_label.image = None
+            except tk.TclError:
+                self._close_loading_window()
             return
-        self.loading_gif_label.configure(image=frame)
-        self.loading_gif_label.image = frame
+        try:
+            self.loading_gif_label.configure(image=frame)
+            self.loading_gif_label.image = frame
+        except tk.TclError:
+            self._close_loading_window()
+            return
         next_index = self._loading_gif_frame_index + 1
         if self._load_loading_gif_frame(next_index) is None:
             next_index = 0
@@ -643,11 +791,13 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.loading_gif_label = None
 
     def _set_task_busy(self, busy: bool) -> None:
+        self._ui_busy = busy
         for widget in self._busy_widgets:
             widget.configure(state="disabled" if busy else "normal")
         self.cancel_task_button.configure(state="normal" if busy else "disabled")
         self.source_type_combo.configure(state="disabled" if busy else "readonly")
         self.media_sort_combo.configure(state="disabled" if busy else "readonly")
+        self._update_replace_controls()
 
     def _apply_task_progress(self, progress: TaskProgress) -> None:
         self.task_status_var.set(progress.message or "Working...")
@@ -669,6 +819,30 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.task_progress_var.set(0.0)
         self._close_loading_window()
         self._set_task_busy(False)
+        self._update_replace_controls()
+        self._schedule_pending_pack_selection()
+
+    def _schedule_pending_pack_selection(self) -> None:
+        if self._pending_pack_relative_path is None or self.task_runner.is_running:
+            return
+        if self._pending_pack_after_id is not None:
+            try:
+                self.after_cancel(self._pending_pack_after_id)
+            except tk.TclError:
+                pass
+        self._pending_pack_after_id = self.after_idle(self._load_pending_pack_selection)
+
+    def _load_pending_pack_selection(self) -> None:
+        self._pending_pack_after_id = None
+        pending_relative_path = self._pending_pack_relative_path
+        if pending_relative_path is None or self.task_runner.is_running:
+            return
+        descriptor = self._selected_descriptor()
+        if descriptor is None or descriptor.relative_path != pending_relative_path:
+            self._pending_pack_relative_path = None
+            return
+        self._pending_pack_relative_path = None
+        self._on_pack_select(None)
 
     def _cancel_task(self) -> None:
         if not self.task_runner.is_running:
@@ -686,7 +860,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         on_success: callable,
     ) -> None:
         if self.task_runner.is_running:
-            messagebox.showinfo("Other workspace busy", "Wait for the current Other workspace task to finish first.")
+            self._show_info_window("Other workspace busy", "Wait for the current Other workspace task to finish first.")
             return
         self._set_task_busy(True)
         self.task_status_var.set(start_message)
@@ -701,7 +875,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 self.task_status_var.set("Cancelled.")
                 return
             self._set_text_widget(self.logs_text, details)
-            self.app._show_error_window(error_title, str(exc))
+            self._show_error_window(error_title, str(exc))
             self._append_status(error_title.replace(" failed", " failed."))
 
         self.task_runner.start(
@@ -749,10 +923,68 @@ class OtherWorkspaceFrame(ttk.Frame):
         target.mkdir(parents=True, exist_ok=True)
         os.startfile(str(target))
 
+    def _clear_cache(self) -> None:
+        if self.task_runner.is_running:
+            self._show_info_window("Clear cache", "Wait for the current Other workspace task to finish first.")
+            return
+
+        target = self._resolve_cache_root()
+        if not target.exists() and self.index is None:
+            self._show_info_window("Clear cache", "The Other workspace cache is already empty.")
+            return
+
+        source_type = self.source_type_var.get().strip() or DEFAULT_OTHER_SOURCE_TYPE
+        prompt = (
+            f"Delete the Other workspace cache at:\n{target}\n\n"
+            f"This will remove cached {source_type} workspace data and clear the loaded pack browser."
+        )
+        if not self._ask_yes_no_window("Clear cache", prompt):
+            return
+
+        self.preview_player.stop()
+
+        def worker(progress, log):
+            progress("Clearing Other workspace cache...")
+            log(f"Clearing Other cache: {target}")
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=False)
+            return target
+
+        def on_success(result: object) -> None:
+            cleared_target = result if isinstance(result, Path) else target
+            self.preview_player.clear_cache()
+            self.index = None
+            self.pack_rows_cache.clear()
+            self.current_pack_rows = None
+            self.pack_iid_map.clear()
+            self.visible_rows = []
+            self._pending_pack_relative_path = None
+            self.pack_tree.delete(*self.pack_tree.get_children())
+            self._cancel_media_render()
+            self.media_tree.delete(*self.media_tree.get_children())
+            self.media_iid_rows.clear()
+            self.media_group_iids.clear()
+            self.workspace_var.set("Workspace: none")
+            self.selection_var.set("Select a .pck file to browse its media.")
+            self.details_var.set("No media selected.")
+            self.media_count_var.set("0 shown / 0 total")
+            self.task_status_var.set("Other workspace cache cleared.")
+            self._set_text_widget(self.details_text, "")
+            self._set_text_widget(self.logs_text, "No Other workspace loaded.")
+            self._update_replace_controls()
+            self._append_status(f"Cleared Other cache: {cleared_target}")
+
+        self._run_task(
+            start_message="Clearing Other workspace cache...",
+            error_title="Clear cache failed",
+            worker=worker,
+            on_success=on_success,
+        )
+
     def _build_workspace(self) -> None:
         root_path = self._resolve_root()
         if root_path is None:
-            messagebox.showinfo("Build workspace", "Select the folder containing the .pck files first.")
+            self._show_info_window("Build workspace", "Select the folder containing the .pck files first.")
             return
         cache_root = str(self._resolve_cache_root())
         source_type = self.source_type_var.get().strip() or AKPK_SOURCE_TYPE
@@ -790,7 +1022,7 @@ class OtherWorkspaceFrame(ttk.Frame):
             on_success=on_success,
         )
 
-    def _populate_pack_browser(self) -> None:
+    def _populate_pack_browser(self, preferred_relative_path: str | None = None) -> None:
         self.pack_tree.delete(*self.pack_tree.get_children())
         self.pack_iid_map.clear()
         self.current_pack_rows = None
@@ -799,31 +1031,38 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.media_iid_rows.clear()
         self.media_group_iids.clear()
         self.visible_rows = []
+        self._pending_pack_relative_path = None
         self.media_count_var.set("0 shown / 0 total")
         self.selection_var.set("Select a .pck file to browse its media.")
         self.details_var.set("No media selected.")
         self._set_text_widget(self.details_text, workspace_details_text(self.index) if self.index is not None else "")
         if self.index is None:
+            self._update_replace_controls()
             return
 
         first_iid: str | None = None
+        preferred_iid: str | None = None
         for descriptor in self.index.packs:
             iid = f"pack::{descriptor.relative_path}"
             self.pack_tree.insert("", "end", iid=iid, text=descriptor.display_name)
             self.pack_iid_map[iid] = descriptor
             if first_iid is None:
                 first_iid = iid
+            if preferred_relative_path and descriptor.relative_path == preferred_relative_path:
+                preferred_iid = iid
 
-        if first_iid is not None:
-            self.pack_tree.selection_set(first_iid)
-            self.pack_tree.focus(first_iid)
-            self.pack_tree.see(first_iid)
+        target_iid = preferred_iid or first_iid
+        if target_iid is not None:
+            self.pack_tree.selection_set(target_iid)
+            self.pack_tree.focus(target_iid)
+            self.pack_tree.see(target_iid)
             if self._pack_select_after_id is not None:
                 try:
                     self.after_cancel(self._pack_select_after_id)
                 except tk.TclError:
                     pass
             self._pack_select_after_id = self.after_idle(self._run_initial_pack_selection)
+        self._update_replace_controls()
 
     def _run_initial_pack_selection(self) -> None:
         self._pack_select_after_id = None
@@ -842,12 +1081,14 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.selection_var.set(descriptor.relative_path)
         cached = self.pack_rows_cache.get(descriptor.relative_path)
         if cached is not None:
+            self._pending_pack_relative_path = None
             self.current_pack_rows = cached
             self._set_text_widget(self.details_text, cached.summary_text)
             self._refresh_media_tree()
             self._refresh_logs()
             return
         if self.task_runner.is_running or self.index is None:
+            self._pending_pack_relative_path = descriptor.relative_path
             return
 
         def worker(progress, log):
@@ -872,12 +1113,18 @@ class OtherWorkspaceFrame(ttk.Frame):
             self._refresh_media_tree()
             self._refresh_logs()
 
-        self._run_task(
-            start_message=f"Loading {descriptor.display_name}...",
-            error_title="Load pack failed",
-            worker=worker,
-            on_success=on_success,
-        )
+        self._pending_pack_relative_path = descriptor.relative_path
+        try:
+            self._run_task(
+                start_message=f"Loading {descriptor.display_name}...",
+                error_title="Load pack failed",
+                worker=worker,
+                on_success=on_success,
+            )
+        except RuntimeError as exc:
+            if "already running" not in str(exc):
+                raise
+            self._append_status(f"Queued {descriptor.display_name} until the current task finishes.")
 
     def _refresh_logs(self) -> None:
         if self.current_pack_rows is not None:
@@ -965,6 +1212,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         if self.current_pack_rows is None:
             self.media_count_var.set("0 shown / 0 total")
             self._update_preview_action_controls()
+            self._update_replace_controls()
             return
 
         context_rows = self.current_pack_rows.rows
@@ -981,6 +1229,7 @@ class OtherWorkspaceFrame(ttk.Frame):
             self.details_var.set("No media rows matched this pack.")
             self._set_text_widget(self.details_text, self.current_pack_rows.summary_text)
             self._update_preview_action_controls()
+            self._update_replace_controls()
             return
 
         view_items = build_pck_view_items(visible_rows, self.group_similar_var.get())
@@ -1073,6 +1322,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         else:
             self.details_var.set("No media rows matched this pack.")
         self._update_preview_action_controls()
+        self._update_replace_controls()
 
     def _selected_rows(self) -> list[PckAudioRow]:
         rows: list[PckAudioRow] = []
@@ -1093,6 +1343,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 rows = [self.visible_rows[0]]
             else:
                 self.details_var.set("No media selected.")
+                self._update_replace_controls()
                 return
         row = rows[0]
         duration_ms, sample_count = _row_signature(row)
@@ -1141,6 +1392,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 detail_lines.append(" | ".join(bits))
         self._set_text_widget(self.details_text, "\n".join(detail_lines))
         self._update_preview_action_controls()
+        self._update_replace_controls()
 
     def _selected_group_preview_rows(self) -> list[PckAudioRow]:
         return matching_pck_group_rows(self._selected_rows())
@@ -1172,12 +1424,12 @@ class OtherWorkspaceFrame(ttk.Frame):
     def _play_selected(self) -> None:
         entry = self._selected_preview_entry()
         if entry is None:
-            messagebox.showinfo("Preview media", "Select a media row to preview first.")
+            self._show_info_window("Preview media", "Select a media row to preview first.")
             return
         try:
             preview_path = self.preview_player.play_entry(entry, self._append_status)
         except Exception as exc:
-            self.app._show_error_window("Preview failed", str(exc))
+            self._show_error_window("Preview failed", str(exc))
             self._append_status("Other preview failed.")
             return
         self._append_status(f"Previewing {preview_path.name}.")
@@ -1185,15 +1437,15 @@ class OtherWorkspaceFrame(ttk.Frame):
     def _play_selected_together(self) -> None:
         rows = self._selected_group_preview_rows()
         if len(rows) < 2:
-            messagebox.showinfo("Preview media", "Select two or more matching media rows first.")
+            self._show_info_window("Preview media", "Select two or more matching media rows first.")
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            self.app._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
+            self._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
             return
         try:
             preview_path = self.preview_player.play_combined_sources([row.cached_path for row in rows], self._append_status)
         except Exception as exc:
-            self.app._show_error_window("Preview failed", str(exc))
+            self._show_error_window("Preview failed", str(exc))
             self._append_status("Other group preview failed.")
             return
         self._append_status(f"Previewing {len(rows)} files together from {preview_path.name}.")
@@ -1209,6 +1461,10 @@ class OtherWorkspaceFrame(ttk.Frame):
             self.media_tree.selection_set(node_id)
             self.media_tree.focus(node_id)
             self._on_media_select(event)
+        self.media_context_menu.entryconfigure(
+            "Replace Selected Audio...",
+            state="normal" if self._can_replace_selected_audio() else "disabled",
+        )
         self._popup_context_menu(self.media_context_menu, self.media_tree, event)
         return "break"
 
@@ -1224,10 +1480,164 @@ class OtherWorkspaceFrame(ttk.Frame):
         self._persist_settings()
         return resolved
 
+    def _replace_selected_media(self) -> None:
+        if not self.enable_replace_audio_var.get():
+            self._show_info_window("Replace selected audio", "Enable the experimental AKPK replacement toggle first.")
+            return
+        if self.index is None:
+            self._show_info_window("Replace selected audio", "Build the Other workspace first.")
+            return
+        row = self._selected_replaceable_row()
+        if row is None:
+            self._show_info_window(
+                "Replace selected audio",
+                "Select exactly one media row to replace. Group rows and multi-select replacements are not supported yet.",
+            )
+            return
+
+        selection = filedialog.askopenfilename(
+            title=f"Replace {row.display_name}",
+            filetypes=[("Wwise media", "*.wem"), *COMMON_AUDIO_FILETYPES, ("All files", "*.*")],
+        )
+        if not selection:
+            return
+        replacement_path = Path(selection).resolve()
+        try:
+            replacement_metadata = probe_audio_metadata(replacement_path)
+        except Exception as exc:
+            self._show_error_window("Replace selected audio failed", f"Could not inspect the selected audio. {exc}")
+            return
+        self.preview_player.environment = discover_media_tools()
+        self.preview_tools_var.set(self.preview_player.environment.summary())
+        missing_tools = missing_wem_conversion_requirements(replacement_path, self.preview_player.environment)
+        if missing_tools:
+            layout = ensure_portable_tool_layout()
+            details = [
+                "This replacement needs extra portable tools before it can be converted to .wem.",
+                "",
+                f"Selected file: {replacement_path.name}",
+                f"Missing tools: {', '.join(missing_tools)}",
+                "",
+                f"Portable tools folder: {layout['root']}",
+                f"Wwise drop folder: {layout['wwise']}",
+                f"FFmpeg drop folder: {layout['ffmpeg']}",
+                "",
+                "For portable Wwise, preserve the Authoring layout:",
+                "tools/wwise/Authoring/Data",
+                "tools/wwise/Authoring/x64/Release/bin/WwiseConsole.exe",
+                "",
+                "Open the portable tools folder now?",
+            ]
+            should_open = self._ask_yes_no_window(
+                "Missing conversion tools",
+                "\n".join(details),
+                kind="warning",
+            )
+            if should_open:
+                os.startfile(str(layout["root"]))
+            self._append_status("Replacement cancelled until portable conversion tools are available.")
+            return
+        if row.duration_ms > 0 and replacement_metadata.duration_ms > 0:
+            duration_delta = abs(replacement_metadata.duration_ms - row.duration_ms)
+            if duration_delta > 5:
+                should_continue = self._ask_yes_no_window(
+                    "Audio length mismatch",
+                    (
+                        "The selected replacement audio does not match the current file length.\n\n"
+                        f"Current audio: {row.duration_ms} ms / {row.sample_count_48k} samples\n"
+                        f"Replacement: {replacement_metadata.duration_ms} ms / {replacement_metadata.sample_count_48k} samples\n\n"
+                        "This can cause looping or timing issues in some games.\n\n"
+                        "Continue anyway?"
+                    ),
+                    kind="warning",
+                )
+                if not should_continue:
+                    self._append_status("Replacement cancelled due to audio length mismatch.")
+                    return
+
+        current_relative_path = (
+            self.current_pack_rows.descriptor.relative_path
+            if self.current_pack_rows is not None
+            else row.source_pack
+        )
+        source_type = self.source_type_var.get().strip() or AKPK_SOURCE_TYPE
+        root_path = self._resolve_root()
+        if root_path is None:
+            self._show_info_window("Replace selected audio", "Select the folder containing the .pck files first.")
+            return
+        cache_root = str(self._resolve_cache_root())
+        index = self.index
+        conversion_root = index.workspace_root / "replacement_conversion"
+
+        def worker(progress, log):
+            normalized_replacement_path = replacement_path
+            if replacement_path.suffix.lower() != ".wem":
+                if progress is not None:
+                    progress(f"Converting {replacement_path.name} to WEM...", 0, 3)
+                normalized_replacement_path = convert_audio_to_wem(
+                    replacement_path,
+                    conversion_root,
+                    log=log,
+                )
+            replacement_result = replace_pck_audio_row(
+                index,
+                row,
+                normalized_replacement_path,
+                log,
+                progress=progress,
+                cancel_event=self.task_runner.cancel_event,
+            )
+            refreshed_index = scan_pck_root(
+                source_type,
+                root_path,
+                cache_root,
+                log,
+                progress=progress,
+                cancel_event=self.task_runner.cancel_event,
+            )
+            refreshed_pack_rows = None
+            matching_descriptor = next(
+                (descriptor for descriptor in refreshed_index.packs if descriptor.relative_path == current_relative_path),
+                None,
+            )
+            if matching_descriptor is not None:
+                refreshed_pack_rows = load_pck_pack_rows(
+                    refreshed_index,
+                    matching_descriptor,
+                    log,
+                    progress=progress,
+                    cancel_event=self.task_runner.cancel_event,
+                )
+            return replacement_result, refreshed_index, refreshed_pack_rows, current_relative_path
+
+        def on_success(result: object) -> None:
+            if not isinstance(result, tuple) or len(result) != 4:
+                return
+            replacement_result, refreshed_index, refreshed_pack_rows, preferred_pack = result
+            if not isinstance(replacement_result, PckAudioReplacementResult) or not isinstance(refreshed_index, PckWorkspaceIndex):
+                return
+            self.index = refreshed_index
+            self.pack_rows_cache.clear()
+            if isinstance(refreshed_pack_rows, PckPackRows):
+                self.pack_rows_cache[refreshed_pack_rows.descriptor.relative_path] = refreshed_pack_rows
+            self._populate_pack_browser(preferred_relative_path=preferred_pack if isinstance(preferred_pack, str) else None)
+            self.workspace_var.set(f"Workspace: {self.index.workspace_root}")
+            self._refresh_logs()
+            self._append_status(
+                f"Replaced media {replacement_result.file_id} in {replacement_result.source_pack}. Backup: {replacement_result.backup_path.name}"
+            )
+
+        self._run_task(
+            start_message=f"Replacing audio {row.display_name}...",
+            error_title="Replace selected audio failed",
+            worker=worker,
+            on_success=on_success,
+        )
+
     def _export_selected_media(self) -> None:
         rows = self._selected_rows()
         if not rows:
-            messagebox.showinfo("Export selected media", "Select one or more media rows first.")
+            self._show_info_window("Export selected media", "Select one or more media rows first.")
             return
         destination = self._ask_export_directory("Export selected media")
         if destination is None:
@@ -1256,10 +1666,10 @@ class OtherWorkspaceFrame(ttk.Frame):
     def _export_selected_media_mixed(self) -> None:
         rows = self._selected_group_preview_rows()
         if len(rows) < 2:
-            messagebox.showinfo("Export mixed audio", "Select two or more matching media rows first.")
+            self._show_info_window("Export mixed audio", "Select two or more matching media rows first.")
             return
         if self.preview_player.environment.ffmpeg_path is None:
-            self.app._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
+            self._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
         destination_root = self._ask_export_directory("Export mixed audio")

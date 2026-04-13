@@ -7,10 +7,9 @@ import tempfile
 import traceback
 import time
 import tkinter as tk
-import winsound
 from dataclasses import replace
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from dyingaudio.audio_info import probe_audio_metadata
@@ -25,6 +24,14 @@ from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
 from dyingaudio.models import AudioEntry
 from dyingaudio.other_workspace import OtherWorkspaceFrame
+from dyingaudio.popups import (
+    ask_string_dialog,
+    ask_yes_no_cancel_dialog,
+    ask_yes_no_dialog,
+    show_error_dialog,
+    show_info_dialog,
+    show_warning_dialog,
+)
 from dyingaudio.settings import (
     AppSettings,
     DEFAULT_AUDIO_PROCS,
@@ -91,12 +98,6 @@ class DyingAudioApp(tk.Tk):
         self._loading_gif_subsample = 1
         self._loading_gif_after_id: str | None = None
         self._loading_gif_frame_index = 0
-
-        self.error_warning_window: tk.Toplevel | None = None
-        self.error_warning_title_label: ttk.Label | None = None
-        self.error_warning_message_label: ttk.Label | None = None
-        self.error_warning_icon_label: ttk.Label | None = None
-        self.error_warning_ok_button: ttk.Button | None = None
 
         self.selected_name_var = tk.StringVar()
         self.selected_type_var = tk.StringVar(value="2")
@@ -170,6 +171,10 @@ class DyingAudioApp(tk.Tk):
         self.option_add("*Menu.foreground", foreground)
         self.option_add("*Menu.activeBackground", panel_background)
         self.option_add("*Menu.activeForeground", foreground)
+        self.option_add("*TCombobox*Listbox.background", panel_background)
+        self.option_add("*TCombobox*Listbox.foreground", foreground)
+        self.option_add("*TCombobox*Listbox.selectBackground", selected_background)
+        self.option_add("*TCombobox*Listbox.selectForeground", selected_foreground)
 
         self.style.configure(".", background=background, foreground=foreground)
         self.style.configure("TFrame", background=background)
@@ -485,7 +490,7 @@ class DyingAudioApp(tk.Tk):
 
         actions = ttk.Frame(bottom)
         actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        for index in range(6):
+        for index in range(7):
             actions.columnconfigure(index, weight=1)
 
         self.open_csb_button = ttk.Button(actions, text="Open CSB For Edit", command=self._open_csb_for_editing)
@@ -500,7 +505,9 @@ class DyingAudioApp(tk.Tk):
         self.build_mod_button.grid(row=0, column=4, sticky="ew", padx=2)
         self.open_mod_folder_button = ttk.Button(actions, text="Open Mod Folder", command=self._open_mod_folder)
         self.open_mod_folder_button.grid(row=0, column=5, sticky="ew", padx=2)
-        ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=6, sticky="e", padx=4, pady=(4, 0))
+        self.clear_cache_button = ttk.Button(actions, text="Clear Cache", command=self._clear_dl1_cache)
+        self.clear_cache_button.grid(row=0, column=6, sticky="ew", padx=2)
+        ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=7, sticky="e", padx=4, pady=(4, 0))
         self._dl1_busy_widgets = [
             self.add_audio_button,
             self.add_fsb_button,
@@ -517,6 +524,7 @@ class DyingAudioApp(tk.Tk):
             self.save_csb_button,
             self.build_mod_button,
             self.open_mod_folder_button,
+            self.clear_cache_button,
         ]
 
         self.log_text = ScrolledText(bottom, height=9, wrap="word")
@@ -713,125 +721,23 @@ class DyingAudioApp(tk.Tk):
         self._close_loading_window()
         self._set_dl1_busy(False)
 
-    def _show_error_window(self, title: str, message: str) -> None:
-        self._show_error_warning_window(title, message, "error")
+    def _show_info_window(self, title: str, message: str) -> None:
+        show_info_dialog(self, title, message)
 
     def _show_warning_window(self, title: str, message: str) -> None:
-        self._show_error_warning_window(title, message, "warning")
+        show_warning_dialog(self, title, message)
 
-    def _show_error_warning_window(self, title: str, message: str, kind: str) -> None:
-        # Play system sound
-        try:
-            if kind == "error":
-                winsound.MessageBeep(winsound.MB_ICONHAND)
-            elif kind == "warning":
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-        except (ImportError, AttributeError, OSError):
-            # winsound not available or failed, silently continue
-            pass
-        
-        if self.error_warning_window is not None and self.error_warning_window.winfo_exists():
-            self.error_warning_title_label.configure(text=title)
-            self.error_warning_message_label.configure(text=message)
-            self._update_error_warning_icon(kind)
-            self._center_error_warning_window()
-            self.error_warning_window.deiconify()
-            self.error_warning_window.lift()
-            self.error_warning_window.update_idletasks()
-            return
+    def _show_error_window(self, title: str, message: str) -> None:
+        show_error_dialog(self, title, message)
 
-        window = tk.Toplevel(self)
-        window.title("DyingAudio")
-        window.transient(self)
-        window.minsize(300, 200)
-        window.resizable(False, False)
-        window.protocol("WM_DELETE_WINDOW", self._close_error_warning_window)
-        if is_windows_dark_mode():
-            window.configure(bg="#1e1e1e")
-        window.columnconfigure(0, weight=1)
-        window.rowconfigure(0, weight=1)
+    def _ask_yes_no_window(self, title: str, message: str, *, kind: str = "warning") -> bool:
+        return ask_yes_no_dialog(self, title, message, kind=kind)
 
-        container = ttk.Frame(window, padding=18)
-        container.grid(row=0, column=0, sticky="nsew")
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=0)
-        container.rowconfigure(1, weight=0)
-        container.rowconfigure(2, weight=1)
-        container.rowconfigure(3, weight=0)
+    def _ask_yes_no_cancel_window(self, title: str, message: str, *, kind: str = "warning") -> bool | None:
+        return ask_yes_no_cancel_dialog(self, title, message, kind=kind)
 
-        title_label = ttk.Label(container, text=title, font=("TkDefaultFont", 12, "bold"), anchor="center")
-        title_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-
-        icon_frame = ttk.Frame(container, width=64, height=64)
-        icon_frame.grid(row=1, column=0, sticky="n", pady=(0, 10))
-        icon_frame.grid_propagate(False)
-
-        icon_label = ttk.Label(icon_frame, anchor="center")
-        icon_label.place(relx=0.5, rely=0.5, anchor="center")
-
-        message_label = ttk.Label(container, text=message, anchor="center", justify="center", wraplength=280)
-        message_label.grid(row=2, column=0, sticky="ew", pady=(0, 20))
-
-        ok_button = ttk.Button(container, text="OK", command=self._close_error_warning_window)
-        ok_button.grid(row=3, column=0, sticky="s")
-
-        self.error_warning_window = window
-        self.error_warning_title_label = title_label
-        self.error_warning_message_label = message_label
-        self.error_warning_icon_label = icon_label
-        self.error_warning_ok_button = ok_button
-
-        self._update_error_warning_icon(kind)
-
-        window.bind("<Configure>", self._on_error_warning_window_configure)
-        self._center_error_warning_window()
-        window.lift()
-        window.update_idletasks()
-        window.focus_set()
-
-    def _update_error_warning_icon(self, kind: str) -> None:
-        if self.error_warning_icon_label is None:
-            return
-        icon_path = application_root() / "assets" / f"{kind}.png"
-        if not icon_path.exists():
-            self.error_warning_icon_label.configure(text=kind.upper())
-            self.error_warning_icon_label.image = None
-            return
-        try:
-            icon = tk.PhotoImage(file=str(icon_path))
-            # Scale down if too large
-            max_size = 48
-            if icon.width() > max_size or icon.height() > max_size:
-                scale = max(icon.width(), icon.height()) / max_size
-                subsample = max(1, int(scale))
-                icon = icon.subsample(subsample, subsample)
-            self.error_warning_icon_label.configure(image=icon)
-            self.error_warning_icon_label.image = icon
-        except tk.TclError:
-            self.error_warning_icon_label.configure(text=kind.upper())
-            self.error_warning_icon_label.image = None
-
-    def _center_error_warning_window(self) -> None:
-        if self.error_warning_window is None or not self.error_warning_window.winfo_exists():
-            return
-        width = max(self.error_warning_window.winfo_width(), self.error_warning_window.winfo_reqwidth(), 320)
-        height = max(self.error_warning_window.winfo_height(), self.error_warning_window.winfo_reqheight(), 240)
-        self._center_child_window(self.error_warning_window, width, height)
-
-    def _on_error_warning_window_configure(self, event: object) -> None:
-        if self.error_warning_message_label is None or not hasattr(event, "width"):
-            return
-        width = max(200, int(event.width) - 36)
-        self.error_warning_message_label.configure(wraplength=width)
-
-    def _close_error_warning_window(self) -> None:
-        if self.error_warning_window is not None and self.error_warning_window.winfo_exists():
-            self.error_warning_window.destroy()
-        self.error_warning_window = None
-        self.error_warning_title_label = None
-        self.error_warning_message_label = None
-        self.error_warning_icon_label = None
-        self.error_warning_ok_button = None
+    def _ask_string_window(self, title: str, prompt: str, *, initialvalue: str = "") -> str | None:
+        return ask_string_dialog(self, title, prompt, initialvalue=initialvalue)
 
     def _run_dl1_task(
         self,
@@ -842,7 +748,7 @@ class DyingAudioApp(tk.Tk):
         on_success: callable,
     ) -> None:
         if self.task_runner.is_running:
-            messagebox.showinfo("Dying Light 1 workspace busy", "Wait for the current task to finish first.")
+            self._show_info_window("Dying Light 1 workspace busy", "Wait for the current task to finish first.")
             return
         self._set_dl1_busy(True)
         self.task_status_var.set(start_message)
@@ -1428,7 +1334,7 @@ class DyingAudioApp(tk.Tk):
 
         index = self._selected_index()
         if index is None:
-            messagebox.showinfo("Replace audio", "Select an entry to replace first.")
+            self._show_info_window("Replace audio", "Select an entry to replace first.")
             return
 
         selection = filedialog.askopenfilename(
@@ -1467,7 +1373,7 @@ class DyingAudioApp(tk.Tk):
 
         index = self._selected_index()
         if index is None:
-            messagebox.showinfo("Replace FSB", "Select an entry to replace first.")
+            self._show_info_window("Replace FSB", "Select an entry to replace first.")
             return
 
         selection = filedialog.askopenfilename(
@@ -1501,7 +1407,7 @@ class DyingAudioApp(tk.Tk):
 
         entry = self._selected_entry()
         if entry is None:
-            messagebox.showinfo("Export audio", "Select an entry to export first.")
+            self._show_info_window("Export audio", "Select an entry to export first.")
             return
 
         selection = filedialog.asksaveasfilename(
@@ -1547,7 +1453,7 @@ class DyingAudioApp(tk.Tk):
 
         entry = self._selected_entry()
         if entry is None:
-            messagebox.showinfo("Export FSB", "Select an entry to export first.")
+            self._show_info_window("Export FSB", "Select an entry to export first.")
             return
 
         selection = filedialog.asksaveasfilename(
@@ -1650,7 +1556,7 @@ class DyingAudioApp(tk.Tk):
 
         index = self._selected_index()
         if index is None:
-            messagebox.showinfo("Duplicate entry", "Select an entry to duplicate first.")
+            self._show_info_window("Duplicate entry", "Select an entry to duplicate first.")
             return
 
         source_entry = self.entries[index]
@@ -1666,11 +1572,11 @@ class DyingAudioApp(tk.Tk):
 
         index = self._selected_index()
         if index is None:
-            messagebox.showinfo("Rename entry", "Select an entry to rename first.")
+            self._show_info_window("Rename entry", "Select an entry to rename first.")
             return
 
         entry = self.entries[index]
-        new_name = simpledialog.askstring("Rename entry", "Entry name:", initialvalue=entry.entry_name, parent=self)
+        new_name = self._ask_string_window("Rename entry", "Entry name:", initialvalue=entry.entry_name)
         if new_name is None:
             return
 
@@ -1704,7 +1610,7 @@ class DyingAudioApp(tk.Tk):
         if not self._apply_selected_entry():
             return
         if self.sort_field_var.get().strip() != "Original Order":
-            messagebox.showinfo("Reorder entries", "Switch sorting back to Original Order before moving entries manually.")
+            self._show_info_window("Reorder entries", "Switch sorting back to Original Order before moving entries manually.")
             return
         index = self._selected_index()
         if index is None:
@@ -1725,7 +1631,7 @@ class DyingAudioApp(tk.Tk):
             return
         if not self.entries:
             return
-        if not messagebox.askyesno("Clear entries", "Remove all current entries?"):
+        if not self._ask_yes_no_window("Clear entries", "Remove all current entries?"):
             return
         self.preview_player.stop()
         self._reset_preview_progress()
@@ -1737,6 +1643,51 @@ class DyingAudioApp(tk.Tk):
         self._refresh_tree()
         self._update_preview_info()
         self.status_var.set("Cleared all entries.")
+
+    def _clear_dl1_cache(self) -> None:
+        if self.task_runner.is_running:
+            self._show_info_window("Clear cache", "Wait for the current Dying Light 1 task to finish first.")
+            return
+
+        has_edit_session = self.edit_session_dir is not None
+        prompt = (
+            "Clear the Dying Light 1 temporary cache?\n\n"
+            "This will clear preview files and unload the current extracted CSB edit session."
+            if has_edit_session
+            else "Clear the Dying Light 1 temporary cache?\n\nThis will clear preview files."
+        )
+        if not self._ask_yes_no_window("Clear cache", prompt):
+            return
+
+        self.preview_player.stop()
+        self._reset_preview_progress()
+        session_dir = self.edit_session_dir
+
+        def worker(progress, log):
+            progress("Clearing Dying Light 1 cache...")
+            log("Clearing Dying Light 1 preview and edit-session cache.")
+            if session_dir is not None:
+                session_dir.cleanup()
+            return True
+
+        def on_success(_result: object) -> None:
+            self.preview_player.clear_cache()
+            self.edit_session_dir = None
+            self.entries.clear()
+            self._set_loaded_csb(None)
+            self._set_loaded_csb_magic(None)
+            self._set_loaded_csb_layout(None)
+            self._refresh_tree()
+            self._update_preview_info()
+            self.status_var.set("Cleared Dying Light 1 cache.")
+            self._append_log("Cleared Dying Light 1 preview and edit-session cache.")
+
+        self._run_dl1_task(
+            start_message="Clearing Dying Light 1 cache...",
+            error_title="Clear cache failed",
+            worker=worker,
+            on_success=on_success,
+        )
 
     def _inspect_csb(self) -> None:
         selection = filedialog.askopenfilename(
@@ -1831,7 +1782,7 @@ class DyingAudioApp(tk.Tk):
         target_path: Path | None = None
         overwrite_loaded = False
         if self.loaded_csb_path is not None:
-            choice = messagebox.askyesnocancel(
+            choice = self._ask_yes_no_cancel_window(
                 "Save CSB file",
                 f"Overwrite the loaded CSB?\n\n{self.loaded_csb_path}\n\nChoose No to pick another .csb file.",
             )
@@ -1859,10 +1810,7 @@ class DyingAudioApp(tk.Tk):
             if not selection:
                 return
             target_path = Path(selection).resolve()
-            if target_path.exists() and not messagebox.askyesno(
-                "Overwrite CSB",
-                f"Replace this file?\n\n{target_path}",
-            ):
+            if target_path.exists() and not self._ask_yes_no_window("Overwrite CSB", f"Replace this file?\n\n{target_path}"):
                 return
 
         def worker(progress, log):
@@ -1883,7 +1831,7 @@ class DyingAudioApp(tk.Tk):
             self.task_status_var.set("Save complete.")
             self.status_var.set(f"Saved {csb_result.csb_path.name}.")
             self._append_log(f"Saved CSB file: {csb_result.csb_path}")
-            messagebox.showinfo("Save complete", f"Saved CSB file:\n{csb_result.csb_path}")
+            self._show_info_window("Save complete", f"Saved CSB file:\n{csb_result.csb_path}")
 
         self._run_dl1_task(
             start_message=f"Saving {target_path.name}...",
@@ -1898,7 +1846,7 @@ class DyingAudioApp(tk.Tk):
 
         index = self._selected_index()
         if index is None:
-            messagebox.showinfo("Preview audio", "Select an entry to preview first.")
+            self._show_info_window("Preview audio", "Select an entry to preview first.")
             return
 
         entry = self.entries[index]
@@ -1941,7 +1889,7 @@ class DyingAudioApp(tk.Tk):
         self._ensure_raw_builder_mode(notify=True)
         mods_root = self._resolve_mods_root(allow_discovery=True)
         if mods_root is None:
-            messagebox.showinfo(
+            self._show_info_window(
                 "Build mod",
                 "Select the Dying Light Mods folder first, or click Browse to auto-find it.",
             )
@@ -1959,7 +1907,7 @@ class DyingAudioApp(tk.Tk):
                         self.dldt_root_var.set(str(dldt_root))
         self._save_settings()
         if self._has_raw_entries() and self.current_toolchain is None:
-            messagebox.showinfo(
+            self._show_info_window(
                 "Build mod",
                 "Select or auto-find the DLDT toolchain first.",
             )
@@ -1989,7 +1937,7 @@ class DyingAudioApp(tk.Tk):
             self._append_log(f"modinfo.ini: {artifacts.modinfo_path}")
             if artifacts.script_path is not None:
                 self._append_log(f"audiodata.scr: {artifacts.script_path}")
-            messagebox.showinfo("Build complete", f"Built mod folder:\n{artifacts.mod_root}")
+            self._show_info_window("Build complete", f"Built mod folder:\n{artifacts.mod_root}")
 
         self._run_dl1_task(
             start_message=f"Building mod '{self.mod_name_var.get().strip() or DEFAULT_MOD_NAME}'...",
@@ -2005,13 +1953,13 @@ class DyingAudioApp(tk.Tk):
         elif mods_root is not None:
             target = mods_root / (self.mod_name_var.get().strip() or DEFAULT_MOD_NAME)
         else:
-            messagebox.showinfo(
+            self._show_info_window(
                 "Open mod folder",
                 "Select the Dying Light Mods folder first, or click Browse to auto-find it.",
             )
             return
         if not target.exists():
-            messagebox.showinfo("Open mod folder", f"Folder does not exist yet:\n{target}")
+            self._show_info_window("Open mod folder", f"Folder does not exist yet:\n{target}")
             return
         os.startfile(str(target))
 

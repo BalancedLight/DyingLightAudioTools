@@ -33,6 +33,8 @@ class PckSectorEntry:
     size: int
     raw_offset: int
     language_id: int
+    entry_offset: int = 0
+    id_size: int = 4
 
 
 @dataclass(slots=True)
@@ -111,6 +113,18 @@ class PckPackRows:
 
 
 @dataclass(slots=True)
+class PckAudioReplacementResult:
+    source_pack: str
+    pack_path: Path
+    backup_path: Path
+    row_kind: str
+    file_id: int
+    replacement_path: Path
+    replacement_size: int
+    new_offset: int
+
+
+@dataclass(slots=True)
 class PckWorkspaceIndex:
     source_type: str
     root: Path
@@ -143,6 +157,13 @@ class ParsedBankEntry:
     hirc_offset: int | None
 
 
+@dataclass(slots=True)
+class ParsedBankChunk:
+    chunk_id: bytes
+    payload: bytes
+    payload_offset: int
+
+
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise TaskCancelled()
@@ -151,7 +172,7 @@ def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
 def _json_ready(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _json_ready(asdict(value))
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
@@ -246,6 +267,8 @@ def _parse_standard_sector(blob: bytes, start: int, size: int) -> list[PckSector
                 size=entry_size,
                 raw_offset=raw_offset,
                 language_id=language_id,
+                entry_offset=8 + start + entry_offset,
+                id_size=4,
             )
         )
     return entries
@@ -269,6 +292,8 @@ def _parse_external_sector(blob: bytes, start: int, size: int) -> list[PckSector
                 size=entry_size,
                 raw_offset=raw_offset,
                 language_id=language_id,
+                entry_offset=8 + start + entry_offset,
+                id_size=8,
             )
         )
     return entries
@@ -548,6 +573,147 @@ def load_workspace_index(root: str | Path) -> PckWorkspaceIndex:
             for key, refs in dict(payload.get("direct_media_lookup", {})).items()
         },
     )
+
+
+def _append_pack_payload(path: Path, payload: bytes) -> int:
+    with path.open("r+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        offset = handle.tell()
+        if offset > 0xFFFFFFFF:
+            raise RuntimeError(f"'{path.name}' already exceeds the 32-bit AKPK offset limit.")
+        if offset + len(payload) > 0xFFFFFFFF:
+            raise RuntimeError(f"Appending to '{path.name}' would exceed the 32-bit AKPK offset limit.")
+        handle.write(payload)
+    return offset
+
+
+def _update_entry_location(path: Path, entry: PckSectorEntry, size: int, raw_offset: int) -> None:
+    size_field_offset = entry.entry_offset + entry.id_size + 4
+    raw_offset_field = size_field_offset + 4
+    with path.open("r+b") as handle:
+        handle.seek(size_field_offset)
+        handle.write(struct.pack("<I", size))
+        handle.seek(raw_offset_field)
+        handle.write(struct.pack("<I", raw_offset))
+
+
+def _ensure_pack_backup(path: Path) -> Path:
+    backup_path = Path(f"{path}.bak")
+    if not backup_path.exists():
+        shutil.copy2(path, backup_path)
+    return backup_path
+
+
+def _descriptor_lookup(index: PckWorkspaceIndex) -> dict[str, PckPackDescriptor]:
+    return {descriptor.relative_path: descriptor for descriptor in index.packs}
+
+
+def _candidate_direct_media_refs(
+    index: PckWorkspaceIndex,
+    selected_pack: str,
+    media_id: int,
+) -> list[DirectMediaRef]:
+    refs = index.direct_media_lookup.get(media_id, [])
+    if not refs:
+        return []
+    same_pack_refs = [ref for ref in refs if ref.source_pack == selected_pack]
+    if same_pack_refs:
+        return same_pack_refs
+    return refs
+
+
+def _find_matching_top_level_entry(header: ParsedPckHeader, row: PckAudioRow) -> PckSectorEntry | None:
+    for entry in header.sound_entries:
+        if entry.file_id == row.file_id and entry.raw_offset == row.playable_offset and entry.size == row.size:
+            return entry
+    for entry in header.external_entries:
+        if entry.file_id == row.file_id and entry.raw_offset == row.playable_offset and entry.size == row.size:
+            return entry
+    return None
+
+
+def _read_pack_slice(path: Path, offset: int, size: int) -> bytes:
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        payload = handle.read(size)
+    if len(payload) != size:
+        raise RuntimeError(f"Could not read the full payload from '{path.name}' at offset {offset}.")
+    return payload
+
+
+def _parse_bank_chunks(bank_bytes: bytes) -> tuple[list[ParsedBankChunk], bytes]:
+    chunks: list[ParsedBankChunk] = []
+    position = 0
+    while position + 8 <= len(bank_bytes):
+        chunk_id = bank_bytes[position:position + 4]
+        chunk_length = struct.unpack_from("<I", bank_bytes, position + 4)[0]
+        payload_offset = position + 8
+        next_position = payload_offset + chunk_length
+        if next_position > len(bank_bytes):
+            break
+        chunks.append(
+            ParsedBankChunk(
+                chunk_id=chunk_id,
+                payload=bank_bytes[payload_offset:next_position],
+                payload_offset=payload_offset,
+            )
+        )
+        position = next_position
+    return chunks, bank_bytes[position:]
+
+
+def _build_bank_blob_with_replacement(bank_bytes: bytes, bank_entry: PckSectorEntry, row: PckAudioRow, replacement_bytes: bytes) -> bytes:
+    chunks, trailing_bytes = _parse_bank_chunks(bank_bytes)
+    didx_index: int | None = None
+    data_index: int | None = None
+    didx_entries: list[tuple[int, int, int]] = []
+    target_index: int | None = None
+
+    for index, chunk in enumerate(chunks):
+        if chunk.chunk_id == b"DIDX":
+            didx_index = index
+            for entry_index in range(len(chunk.payload) // 12):
+                media_id, relative_offset, media_size = struct.unpack_from("<III", chunk.payload, entry_index * 12)
+                didx_entries.append((media_id, relative_offset, media_size))
+        elif chunk.chunk_id == b"DATA":
+            data_index = index
+
+    if didx_index is None or data_index is None:
+        raise RuntimeError(f"Bank entry {row.file_id} does not contain DIDX/DATA media.")
+
+    data_chunk = chunks[data_index]
+    for index, (media_id, relative_offset, media_size) in enumerate(didx_entries):
+        absolute_offset = bank_entry.raw_offset + data_chunk.payload_offset + relative_offset
+        if media_id == row.file_id and absolute_offset == row.playable_offset and media_size == row.size:
+            target_index = index
+            break
+
+    if target_index is None:
+        raise RuntimeError(
+            f"Could not find embedded media ID {row.file_id} at offset {row.playable_offset} inside '{row.source_pack}'."
+        )
+
+    rebuilt_data = bytearray()
+    rebuilt_didx = bytearray()
+    for index, (media_id, relative_offset, media_size) in enumerate(didx_entries):
+        if index == target_index:
+            payload = replacement_bytes
+        else:
+            payload = data_chunk.payload[relative_offset:relative_offset + media_size]
+        rebuilt_didx.extend(struct.pack("<III", media_id, len(rebuilt_data), len(payload)))
+        rebuilt_data.extend(payload)
+
+    rebuilt_chunks = list(chunks)
+    rebuilt_chunks[didx_index] = ParsedBankChunk(chunk_id=b"DIDX", payload=bytes(rebuilt_didx), payload_offset=0)
+    rebuilt_chunks[data_index] = ParsedBankChunk(chunk_id=b"DATA", payload=bytes(rebuilt_data), payload_offset=0)
+
+    bank_blob = bytearray()
+    for chunk in rebuilt_chunks:
+        bank_blob.extend(chunk.chunk_id)
+        bank_blob.extend(struct.pack("<I", len(chunk.payload)))
+        bank_blob.extend(chunk.payload)
+    bank_blob.extend(trailing_bytes)
+    return bytes(bank_blob)
 
 
 def _pack_rows_root(index: PckWorkspaceIndex, descriptor: PckPackDescriptor) -> Path:
@@ -854,7 +1020,7 @@ def _parse_bank_rows(
                     )
                 continue
 
-            matching_refs = index.direct_media_lookup.get(media_id, [])
+            matching_refs = _candidate_direct_media_refs(index, descriptor.relative_path, media_id)
             if not matching_refs:
                 unresolved.append(
                     PckUnresolvedItem(
@@ -918,6 +1084,91 @@ def _summary_text(descriptor: PckPackDescriptor, rows: list[PckAudioRow], unreso
         if len(unresolved) > 50:
             lines.append(f"... {len(unresolved) - 50} more unresolved item(s)")
     return "\n".join(lines)
+
+
+def replace_pck_audio_row(
+    index: PckWorkspaceIndex,
+    row: PckAudioRow,
+    replacement_path: str | Path,
+    log: LogCallback,
+    *,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> PckAudioReplacementResult:
+    _raise_if_cancelled(cancel_event)
+    replacement = Path(replacement_path).expanduser().resolve()
+    if not replacement.exists():
+        raise FileNotFoundError(f"Replacement audio does not exist: {replacement}")
+
+    descriptor = _descriptor_lookup(index).get(row.source_pack)
+    if descriptor is None:
+        raise RuntimeError(f"Could not locate the source pack '{row.source_pack}' in the current workspace.")
+
+    replacement_bytes = replacement.read_bytes()
+    if not replacement_bytes:
+        raise ValueError(f"Replacement audio is empty: {replacement}")
+
+    if progress is not None:
+        progress(f"Preparing backup for {descriptor.absolute_path.name}...", 1, 3)
+    backup_path = _ensure_pack_backup(descriptor.absolute_path)
+    log(f"Backup ready: {backup_path}")
+    _raise_if_cancelled(cancel_event)
+
+    header = parse_pck_header(descriptor.absolute_path)
+    new_offset = 0
+    if row.row_kind == "embedded_bank_media":
+        matching_bank_entry: PckSectorEntry | None = None
+        rebuilt_bank_blob: bytes | None = None
+        for bank_entry in header.bank_entries:
+            _raise_if_cancelled(cancel_event)
+            bank_bytes = _read_pack_slice(descriptor.absolute_path, bank_entry.raw_offset, bank_entry.size)
+            try:
+                rebuilt_bank_blob = _build_bank_blob_with_replacement(bank_bytes, bank_entry, row, replacement_bytes)
+            except RuntimeError:
+                continue
+            matching_bank_entry = bank_entry
+            break
+
+        if matching_bank_entry is None or rebuilt_bank_blob is None:
+            raise RuntimeError(
+                f"Could not find the embedded bank payload for media ID {row.file_id} in '{descriptor.relative_path}'."
+            )
+
+        if progress is not None:
+            progress(f"Appending rebuilt bank data to {descriptor.absolute_path.name}...", 2, 3)
+        new_offset = _append_pack_payload(descriptor.absolute_path, rebuilt_bank_blob)
+        _update_entry_location(descriptor.absolute_path, matching_bank_entry, len(rebuilt_bank_blob), new_offset)
+        log(
+            f"Rebuilt bank media {row.file_id} in {descriptor.relative_path}; bank entry now points to offset {new_offset}."
+        )
+    else:
+        matching_entry = _find_matching_top_level_entry(header, row)
+        if matching_entry is None:
+            raise RuntimeError(
+                f"Could not find the top-level AKPK entry for media ID {row.file_id} in '{descriptor.relative_path}'."
+            )
+
+        if progress is not None:
+            progress(f"Appending replacement audio to {descriptor.absolute_path.name}...", 2, 3)
+        new_offset = _append_pack_payload(descriptor.absolute_path, replacement_bytes)
+        _update_entry_location(descriptor.absolute_path, matching_entry, len(replacement_bytes), new_offset)
+        log(
+            f"Updated {descriptor.relative_path} media {row.file_id} to offset {new_offset} ({len(replacement_bytes)} bytes)."
+        )
+
+    _raise_if_cancelled(cancel_event)
+    if progress is not None:
+        progress("Finalizing AKPK replacement...", 3, 3)
+    return PckAudioReplacementResult(
+        source_pack=descriptor.relative_path,
+        pack_path=descriptor.absolute_path,
+        backup_path=backup_path,
+        row_kind=row.row_kind,
+        file_id=row.file_id,
+        replacement_path=replacement,
+        replacement_size=len(replacement_bytes),
+        new_offset=new_offset,
+    )
 
 
 def load_pck_pack_rows(
