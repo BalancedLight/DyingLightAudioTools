@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import struct
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -13,7 +14,14 @@ from typing import Any, Callable
 
 from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.background import TaskCancelled
-from dyingaudio.core.wwise_named_tree import MediaInfo, parse_hirc_objects, resolve_object_media
+from dyingaudio.core.media_tools import decode_audio_to_wav, discover_media_tools
+from dyingaudio.core.wwise_audio_type import (
+    CONFIDENCE_UNKNOWN,
+    UNKNOWN_AUDIO_TYPE,
+    infer_audio_type,
+    normalize_object_types,
+)
+from dyingaudio.core.wwise_named_tree import MediaInfo, parse_hirc_objects, resolve_object_media_details
 
 
 AKPK_SOURCE_TYPE = "Wwise PCK (AKPK)"
@@ -21,6 +29,7 @@ AKPK_MAGIC = b"AKPK"
 AKPK_SOUND_ENTRY_SIZE = 20
 AKPK_EXTERNAL_ENTRY_SIZE = 24
 STARTER_OBJECT_TYPES = frozenset({2, 5, 7, 11, 13})
+PACK_ROWS_SCHEMA_VERSION = 2
 
 ProgressCallback = Callable[[str, float | None, float | None], None]
 LogCallback = Callable[[str], None]
@@ -44,6 +53,8 @@ class DirectMediaRef:
     file_id: int
     offset: int
     size: int
+    language_id: int = 0
+    language_name: str = ""
 
 
 @dataclass(slots=True)
@@ -80,6 +91,11 @@ class PckAudioRow:
     cached_path: Path
     duration_ms: int = 0
     sample_count_48k: int = 0
+    resolved_object_types: tuple[int, ...] = ()
+    audio_type: str = UNKNOWN_AUDIO_TYPE
+    audio_type_confidence: str = CONFIDENCE_UNKNOWN
+    audio_type_note: str = ""
+    language_name: str = ""
     origins: list[PckOriginRef] = field(default_factory=list)
 
 
@@ -434,6 +450,8 @@ def scan_pck_root(
                     file_id=entry.file_id,
                     offset=entry.raw_offset,
                     size=entry.size,
+                    language_id=entry.language_id,
+                    language_name=descriptor.languages.get(entry.language_id, ""),
                 )
             )
 
@@ -479,16 +497,40 @@ def export_pck_media_rows(
 ) -> list[Path]:
     destination_root_path = Path(destination_root).resolve()
     destination_root_path.mkdir(parents=True, exist_ok=True)
+    tools = discover_media_tools()
+    used_names: set[str] = set()
     exported: list[Path] = []
     total = max(len(rows), 1)
     for index, row in enumerate(rows):
         _raise_if_cancelled(cancel_event)
-        destination = destination_root_path / row.cached_path.name
-        shutil.copy2(row.cached_path, destination)
+        destination = destination_root_path / _pck_export_name(row, used_names)
+        decode_audio_to_wav(row.cached_path, destination, tools=tools)
         exported.append(destination)
         if progress is not None:
-            progress(f"Exporting {row.cached_path.name}", index + 1, total)
+            progress(f"Exporting {destination.name}", index + 1, total)
     return exported
+
+
+def _sanitize_export_stem(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in {"_", "-", "."} else "_" for character in value)
+    return safe.strip("._") or "audio"
+
+
+def _dedupe_export_name(base_stem: str, used_names: set[str]) -> str:
+    stem = _sanitize_export_stem(base_stem)
+    candidate = f"{stem}.wav"
+    counter = 2
+    while candidate.casefold() in used_names:
+        candidate = f"{stem}_{counter}.wav"
+        counter += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def _pck_export_name(row: PckAudioRow, used_names: set[str]) -> str:
+    pack_stem = Path(row.source_pack).stem or "pack"
+    row_stem = Path(row.display_name).stem or f"media_{row.file_id}"
+    return _dedupe_export_name(f"{pack_stem}__{row_stem}", used_names)
 
 
 def _descriptor_from_payload(payload: dict[str, Any]) -> PckPackDescriptor:
@@ -533,6 +575,11 @@ def _row_from_payload(payload: dict[str, Any]) -> PckAudioRow:
         cached_path=Path(payload["cached_path"]).resolve(),
         duration_ms=int(payload.get("duration_ms", 0)),
         sample_count_48k=int(payload.get("sample_count_48k", 0)),
+        resolved_object_types=normalize_object_types(payload.get("resolved_object_types", [])),
+        audio_type=str(payload.get("audio_type", UNKNOWN_AUDIO_TYPE) or UNKNOWN_AUDIO_TYPE),
+        audio_type_confidence=str(payload.get("audio_type_confidence", CONFIDENCE_UNKNOWN) or CONFIDENCE_UNKNOWN),
+        audio_type_note=str(payload.get("audio_type_note", "") or ""),
+        language_name=str(payload.get("language_name", "") or ""),
         origins=[_origin_from_payload(origin) for origin in payload.get("origins", [])],
     )
 
@@ -567,34 +614,14 @@ def load_workspace_index(root: str | Path) -> PckWorkspaceIndex:
                     file_id=int(ref["file_id"]),
                     offset=int(ref["offset"]),
                     size=int(ref["size"]),
+                    language_id=int(ref.get("language_id", 0)),
+                    language_name=str(ref.get("language_name", "") or ""),
                 )
                 for ref in refs
             ]
             for key, refs in dict(payload.get("direct_media_lookup", {})).items()
         },
     )
-
-
-def _append_pack_payload(path: Path, payload: bytes) -> int:
-    with path.open("r+b") as handle:
-        handle.seek(0, os.SEEK_END)
-        offset = handle.tell()
-        if offset > 0xFFFFFFFF:
-            raise RuntimeError(f"'{path.name}' already exceeds the 32-bit AKPK offset limit.")
-        if offset + len(payload) > 0xFFFFFFFF:
-            raise RuntimeError(f"Appending to '{path.name}' would exceed the 32-bit AKPK offset limit.")
-        handle.write(payload)
-    return offset
-
-
-def _update_entry_location(path: Path, entry: PckSectorEntry, size: int, raw_offset: int) -> None:
-    size_field_offset = entry.entry_offset + entry.id_size + 4
-    raw_offset_field = size_field_offset + 4
-    with path.open("r+b") as handle:
-        handle.seek(size_field_offset)
-        handle.write(struct.pack("<I", size))
-        handle.seek(raw_offset_field)
-        handle.write(struct.pack("<I", raw_offset))
 
 
 def _ensure_pack_backup(path: Path) -> Path:
@@ -639,6 +666,104 @@ def _read_pack_slice(path: Path, offset: int, size: int) -> bytes:
     if len(payload) != size:
         raise RuntimeError(f"Could not read the full payload from '{path.name}' at offset {offset}.")
     return payload
+
+
+def _all_pack_entries(header: ParsedPckHeader) -> list[PckSectorEntry]:
+    return [*header.bank_entries, *header.sound_entries, *header.external_entries]
+
+
+def _pack_entries_match(current_entries: list[PckSectorEntry], backup_entries: list[PckSectorEntry]) -> bool:
+    if len(current_entries) != len(backup_entries):
+        return False
+    for current, backup in zip(current_entries, backup_entries):
+        if (
+            current.entry_offset != backup.entry_offset
+            or current.id_size != backup.id_size
+            or current.file_id != backup.file_id
+        ):
+            return False
+    return True
+
+
+def _preferred_entry_offsets(path: Path, header: ParsedPckHeader) -> dict[int, int]:
+    backup_path = Path(f"{path}.bak")
+    if not backup_path.exists():
+        return {}
+    try:
+        backup_header = parse_pck_header(backup_path)
+    except Exception:
+        return {}
+
+    if not (
+        _pack_entries_match(header.bank_entries, backup_header.bank_entries)
+        and _pack_entries_match(header.sound_entries, backup_header.sound_entries)
+        and _pack_entries_match(header.external_entries, backup_header.external_entries)
+    ):
+        return {}
+
+    preferred_offsets: dict[int, int] = {}
+    for current_group, backup_group in (
+        (header.bank_entries, backup_header.bank_entries),
+        (header.sound_entries, backup_header.sound_entries),
+        (header.external_entries, backup_header.external_entries),
+    ):
+        for current, backup in zip(current_group, backup_group):
+            preferred_offsets[current.entry_offset] = backup.raw_offset
+    return preferred_offsets
+
+
+def _set_entry_location_in_blob(blob: bytearray, entry: PckSectorEntry, size: int, raw_offset: int) -> None:
+    size_field_offset = entry.entry_offset + entry.id_size + 4
+    raw_offset_field = size_field_offset + 4
+    blob[size_field_offset:size_field_offset + 4] = struct.pack("<I", size)
+    blob[raw_offset_field:raw_offset_field + 4] = struct.pack("<I", raw_offset)
+
+
+def _rewrite_pack_payloads(
+    path: Path,
+    header: ParsedPckHeader,
+    replacement_payloads: dict[int, bytes],
+) -> dict[int, int]:
+    header_prefix_size = 8 + header.header_size
+    with path.open("rb") as handle:
+        header_blob = bytearray(handle.read(header_prefix_size))
+    if len(header_blob) != header_prefix_size:
+        raise RuntimeError(f"Could not read the AKPK header from '{path.name}'.")
+
+    preferred_offsets = _preferred_entry_offsets(path, header)
+    payloads: dict[int, bytes] = {}
+    entries = _all_pack_entries(header)
+    for entry in entries:
+        payloads[entry.entry_offset] = replacement_payloads.get(entry.entry_offset, _read_pack_slice(path, entry.raw_offset, entry.size))
+
+    ordered_entries = sorted(
+        entries,
+        key=lambda entry: (preferred_offsets.get(entry.entry_offset, entry.raw_offset), entry.entry_offset),
+    )
+
+    next_offset = header_prefix_size
+    new_offsets: dict[int, int] = {}
+    body_parts: list[bytes] = []
+    for entry in ordered_entries:
+        payload = payloads[entry.entry_offset]
+        _set_entry_location_in_blob(header_blob, entry, len(payload), next_offset)
+        new_offsets[entry.entry_offset] = next_offset
+        body_parts.append(payload)
+        next_offset += len(payload)
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, prefix=f"{path.name}.", suffix=".tmp") as handle:
+            temp_path = Path(handle.name)
+            handle.write(header_blob)
+            for payload in body_parts:
+                handle.write(payload)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+    return new_offsets
 
 
 def _parse_bank_chunks(bank_bytes: bytes) -> tuple[list[ParsedBankChunk], bytes]:
@@ -801,6 +926,38 @@ def _row_key_for(selected_pack: str, source_pack: str, offset: int, size: int) -
     return _sha1_text(selected_pack, source_pack, offset, size, length=24)
 
 
+def _refresh_row_audio_type(row: PckAudioRow) -> None:
+    resolution = infer_audio_type(
+        object_types=row.resolved_object_types or [origin.object_type for origin in row.origins],
+        source_pack=row.source_pack,
+        language_name=row.language_name,
+    )
+    row.audio_type = resolution.audio_type
+    row.audio_type_confidence = resolution.confidence
+    row.audio_type_note = resolution.note
+
+
+def _apply_row_context(
+    row: PckAudioRow,
+    origin: PckOriginRef,
+    *,
+    resolved_object_types: tuple[int, ...] = (),
+    language_name: str = "",
+) -> None:
+    row.origins.append(origin)
+    merged_types = set(row.resolved_object_types)
+    merged_types.update(normalize_object_types(resolved_object_types))
+    if origin.object_type is not None:
+        merged_types.add(origin.object_type)
+    row.resolved_object_types = tuple(sorted(merged_types))
+    if language_name:
+        if not row.language_name:
+            row.language_name = language_name
+        elif row.language_name != language_name:
+            row.language_name = "multiple"
+    _refresh_row_audio_type(row)
+
+
 def _append_row(
     rows_by_key: dict[str, PckAudioRow],
     *,
@@ -812,6 +969,8 @@ def _append_row(
     row_kind: str,
     cached_path: Path,
     origin: PckOriginRef,
+    resolved_object_types: tuple[int, ...] = (),
+    language_name: str = "",
 ) -> PckAudioRow:
     row_key = _row_key_for(selected_pack, source_pack, playable_offset, size)
     row = rows_by_key.get(row_key)
@@ -827,7 +986,7 @@ def _append_row(
             cached_path=cached_path,
         )
         rows_by_key[row_key] = row
-    row.origins.append(origin)
+    _apply_row_context(row, origin, resolved_object_types=resolved_object_types, language_name=language_name)
     return row
 
 
@@ -838,6 +997,7 @@ def _materialize_entry(index: PckWorkspaceIndex, source_pack: str, source_path: 
 
 def _build_pack_rows_payload(pack_rows: PckPackRows) -> dict[str, Any]:
     return {
+        "schema_version": PACK_ROWS_SCHEMA_VERSION,
         "descriptor": pack_rows.descriptor,
         "rows": pack_rows.rows,
         "unresolved": pack_rows.unresolved,
@@ -916,6 +1076,7 @@ def _parse_bank_rows(
                 row_kind="embedded_bank_media",
                 cached_path=cached_path,
                 origin=origin,
+                language_name=descriptor.languages.get(entry.language_id, ""),
             )
             local_embedded_rows.setdefault(media_id, []).append(row)
 
@@ -975,11 +1136,11 @@ def _parse_bank_rows(
         )
         return
 
-    memo: dict[int, list[int]] = {}
+    memo: dict[int, dict[int, tuple[int, ...]]] = {}
     for object_id in starter_ids:
         _raise_if_cancelled(cancel_event)
         object_info = objects[object_id]
-        media_ids = resolve_object_media(
+        media_details = resolve_object_media_details(
             object_id,
             objects,
             objects,
@@ -989,6 +1150,7 @@ def _parse_bank_rows(
             set(),
             cancel_event,
         )
+        media_ids = sorted(media_details)
         if not media_ids:
             unresolved.append(
                 PckUnresolvedItem(
@@ -1004,9 +1166,11 @@ def _parse_bank_rows(
 
         for media_id in media_ids:
             _raise_if_cancelled(cancel_event)
+            resolved_object_types = media_details.get(media_id, ())
             if media_id in local_embedded_rows:
                 for row in local_embedded_rows[media_id]:
-                    row.origins.append(
+                    _apply_row_context(
+                        row,
                         PckOriginRef(
                             source_pack=descriptor.relative_path,
                             source_kind="embedded_bank_media",
@@ -1016,7 +1180,9 @@ def _parse_bank_rows(
                             object_id=object_id,
                             object_type=object_info.object_type,
                             note="Resolved from HIRC to embedded media",
-                        )
+                        ),
+                        resolved_object_types=resolved_object_types,
+                        language_name=descriptor.languages.get(entry.language_id, ""),
                     )
                 continue
 
@@ -1055,6 +1221,8 @@ def _parse_bank_rows(
                         object_type=object_info.object_type,
                         note=f"Linked to direct media slice in {ref.source_pack}",
                     ),
+                    resolved_object_types=resolved_object_types,
+                    language_name=ref.language_name,
                 )
 
 
@@ -1135,9 +1303,13 @@ def replace_pck_audio_row(
             )
 
         if progress is not None:
-            progress(f"Appending rebuilt bank data to {descriptor.absolute_path.name}...", 2, 3)
-        new_offset = _append_pack_payload(descriptor.absolute_path, rebuilt_bank_blob)
-        _update_entry_location(descriptor.absolute_path, matching_bank_entry, len(rebuilt_bank_blob), new_offset)
+            progress(f"Rebuilding {descriptor.absolute_path.name} with updated bank data...", 2, 3)
+        new_offsets = _rewrite_pack_payloads(
+            descriptor.absolute_path,
+            header,
+            {matching_bank_entry.entry_offset: rebuilt_bank_blob},
+        )
+        new_offset = new_offsets[matching_bank_entry.entry_offset]
         log(
             f"Rebuilt bank media {row.file_id} in {descriptor.relative_path}; bank entry now points to offset {new_offset}."
         )
@@ -1149,9 +1321,13 @@ def replace_pck_audio_row(
             )
 
         if progress is not None:
-            progress(f"Appending replacement audio to {descriptor.absolute_path.name}...", 2, 3)
-        new_offset = _append_pack_payload(descriptor.absolute_path, replacement_bytes)
-        _update_entry_location(descriptor.absolute_path, matching_entry, len(replacement_bytes), new_offset)
+            progress(f"Rebuilding {descriptor.absolute_path.name} with replacement audio...", 2, 3)
+        new_offsets = _rewrite_pack_payloads(
+            descriptor.absolute_path,
+            header,
+            {matching_entry.entry_offset: replacement_bytes},
+        )
+        new_offset = new_offsets[matching_entry.entry_offset]
         log(
             f"Updated {descriptor.relative_path} media {row.file_id} to offset {new_offset} ({len(replacement_bytes)} bytes)."
         )
@@ -1183,7 +1359,7 @@ def load_pck_pack_rows(
     if metadata_path.exists():
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         rows = [_row_from_payload(item) for item in payload.get("rows", [])]
-        if all(row.cached_path.exists() for row in rows):
+        if int(payload.get("schema_version", 0)) == PACK_ROWS_SCHEMA_VERSION and all(row.cached_path.exists() for row in rows):
             pack_rows = PckPackRows(
                 descriptor=_descriptor_from_payload(payload["descriptor"]),
                 rows=rows,
@@ -1221,6 +1397,7 @@ def load_pck_pack_rows(
                 file_id=entry.file_id,
                 note="Direct sound-sector slice",
             ),
+            language_name=descriptor.languages.get(entry.language_id, ""),
         )
 
     for entry in header.external_entries:
@@ -1244,6 +1421,7 @@ def load_pck_pack_rows(
                 file_id=entry.file_id,
                 note="External-sector slice",
             ),
+            language_name=descriptor.languages.get(entry.language_id, ""),
         )
 
     for entry in header.bank_entries:

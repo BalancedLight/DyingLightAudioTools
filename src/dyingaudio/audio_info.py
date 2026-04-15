@@ -13,15 +13,22 @@ class AudioMetadata:
     duration_ms: int = 0
     sample_count_48k: int = 0
     detected_sample_rate: int = 0
+    channel_count: int = 0
     notes: str = ""
 
 
-def _metadata_from_duration(duration_seconds: float, detected_sample_rate: int, notes: str = "") -> AudioMetadata:
+def _metadata_from_duration(
+    duration_seconds: float,
+    detected_sample_rate: int,
+    channel_count: int = 0,
+    notes: str = "",
+) -> AudioMetadata:
     return AudioMetadata(
         duration_seconds=duration_seconds,
         duration_ms=int(round(duration_seconds * 1000.0)),
         sample_count_48k=int(round(duration_seconds * 48000.0)),
         detected_sample_rate=detected_sample_rate,
+        channel_count=channel_count,
         notes=notes,
     )
 
@@ -30,11 +37,12 @@ def _probe_wav(path: Path) -> AudioMetadata:
     with wave.open(str(path), "rb") as handle:
         frame_rate = handle.getframerate()
         frame_count = handle.getnframes()
+        channel_count = handle.getnchannels()
 
     if frame_rate <= 0:
         raise ValueError(f"Invalid WAV frame rate in '{path}'.")
 
-    return _metadata_from_duration(frame_count / float(frame_rate), frame_rate, "WAV metadata loaded.")
+    return _metadata_from_duration(frame_count / float(frame_rate), frame_rate, channel_count, "WAV metadata loaded.")
 
 
 def _probe_ogg_vorbis(path: Path) -> AudioMetadata:
@@ -42,6 +50,7 @@ def _probe_ogg_vorbis(path: Path) -> AudioMetadata:
     offset = 0
     packet = bytearray()
     sample_rate = 0
+    channel_count = 0
     final_granule = 0
 
     while offset < len(data):
@@ -66,6 +75,7 @@ def _probe_ogg_vorbis(path: Path) -> AudioMetadata:
             payload_offset += lacing
             if lacing < 255:
                 if not sample_rate and len(packet) >= 16 and packet[0] == 1 and packet[1:7] == b"vorbis":
+                    channel_count = int(packet[11])
                     sample_rate = int.from_bytes(packet[12:16], "little", signed=False)
                 packet.clear()
 
@@ -74,7 +84,7 @@ def _probe_ogg_vorbis(path: Path) -> AudioMetadata:
     if sample_rate <= 0 or final_granule <= 0:
         raise ValueError(f"Could not determine OGG duration for '{path}'.")
 
-    return _metadata_from_duration(final_granule / float(sample_rate), sample_rate, "OGG Vorbis metadata loaded.")
+    return _metadata_from_duration(final_granule / float(sample_rate), sample_rate, channel_count, "OGG Vorbis metadata loaded.")
 
 
 def probe_audio_metadata(path: str | Path) -> AudioMetadata:
@@ -90,14 +100,14 @@ def probe_audio_metadata(path: str | Path) -> AudioMetadata:
     if suffix == ".wem":
         vgmstream_result = vgmstream_probe_audio(resolved, tools)
         if vgmstream_result is not None:
-            duration_seconds, detected_sample_rate, sample_count, notes = vgmstream_result
-            metadata = _metadata_from_duration(duration_seconds, detected_sample_rate, notes)
+            duration_seconds, detected_sample_rate, channel_count, sample_count, notes = vgmstream_result
+            metadata = _metadata_from_duration(duration_seconds, detected_sample_rate, channel_count, notes)
             metadata.sample_count_48k = sample_count
             return metadata
 
     ffprobe_result = ffprobe_audio(resolved, tools)
     if ffprobe_result is not None:
-        duration_seconds, detected_sample_rate, notes = ffprobe_result
-        return _metadata_from_duration(duration_seconds, detected_sample_rate, notes)
+        duration_seconds, detected_sample_rate, channel_count, notes = ffprobe_result
+        return _metadata_from_duration(duration_seconds, detected_sample_rate, channel_count, notes)
 
     return AudioMetadata(notes=f"No metadata parser for '{suffix or 'unknown'}' files.")

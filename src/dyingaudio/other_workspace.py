@@ -10,7 +10,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
-from dyingaudio.audio_info import probe_audio_metadata
+from dyingaudio.audio_info import AudioMetadata, probe_audio_metadata
 from dyingaudio.core.media_tools import (
     COMMON_AUDIO_FILETYPES,
     convert_audio_to_wem,
@@ -32,18 +32,30 @@ from dyingaudio.core.pck_workspace import (
     workspace_details_text,
 )
 from dyingaudio.core.preview import PreviewPlayer
+from dyingaudio.core.wwise_audio_type import MUSIC_TRACK_AUDIO_TYPE, SOUND_VOICE_AUDIO_TYPE, UNKNOWN_AUDIO_TYPE, audio_type_label
 from dyingaudio.models import AudioEntry
-from dyingaudio.popups import ask_yes_no_dialog, show_error_dialog, show_info_dialog, show_warning_dialog
+from dyingaudio.popups import ask_yes_no_cancel_dialog, ask_yes_no_dialog, show_error_dialog, show_info_dialog, show_warning_dialog
 from dyingaudio.settings import (
     DEFAULT_OTHER_CACHE_ROOT,
     DEFAULT_OTHER_SOURCE_TYPE,
     OtherSettings,
-    application_root,
+    bundled_resource_root,
     is_windows_dark_mode,
 )
 
 
-MEDIA_SORT_FIELDS = ("Original Order", "ID", "File", "Offset", "Source Pack", "Kind", "Duration", "Samples", "Playable Path")
+MEDIA_SORT_FIELDS = (
+    "Original Order",
+    "ID",
+    "File",
+    "Offset",
+    "Source Pack",
+    "Kind",
+    "Audio Type",
+    "Duration",
+    "Samples",
+    "Playable Path",
+)
 
 
 @dataclass(slots=True)
@@ -87,6 +99,10 @@ def _shared_text(values: list[str]) -> str:
 
 def _media_signature_text(duration_ms: int, sample_count: int) -> str:
     return f"{duration_ms} ms / {sample_count} samples"
+
+
+def _audio_type_text(row: PckAudioRow) -> str:
+    return audio_type_label(row.audio_type, row.audio_type_confidence)
 
 
 def matching_pck_group_rows(rows: list[PckAudioRow]) -> list[PckAudioRow]:
@@ -136,6 +152,8 @@ def filter_and_sort_pck_rows(
             or normalized_search in str(row.playable_offset).lower()
             or normalized_search in row.source_pack.lower()
             or normalized_search in row.row_kind.lower()
+            or normalized_search in _audio_type_text(row).lower()
+            or normalized_search in row.audio_type_note.lower()
             or normalized_search in str(row.cached_path).lower()
             or normalized_search in str(row.duration_ms).lower()
             or normalized_search in str(row.sample_count_48k).lower()
@@ -148,6 +166,7 @@ def filter_and_sort_pck_rows(
             "Offset": lambda pair: pair[1].playable_offset,
             "Source Pack": lambda pair: pair[1].source_pack.lower(),
             "Kind": lambda pair: pair[1].row_kind.lower(),
+            "Audio Type": lambda pair: _audio_type_text(pair[1]).lower(),
             "Duration": lambda pair: pair[1].duration_ms,
             "Samples": lambda pair: pair[1].sample_count_48k,
             "Playable Path": lambda pair: str(pair[1].cached_path).lower(),
@@ -358,7 +377,7 @@ class OtherWorkspaceFrame(ttk.Frame):
 
         self.media_tree = ttk.Treeview(
             media_tree_frame,
-            columns=("file_id", "offset", "source_pack", "kind", "duration", "samples", "path"),
+            columns=("file_id", "offset", "source_pack", "kind", "audio_type", "duration", "samples", "path"),
             show="tree headings",
             height=18,
         )
@@ -371,6 +390,7 @@ class OtherWorkspaceFrame(ttk.Frame):
             ("offset", "Offset", 110),
             ("source_pack", "Source Pack", 190),
             ("kind", "Kind", 140),
+            ("audio_type", "Audio Type", 150),
             ("duration", "Duration", 110),
             ("samples", "Samples", 110),
             ("path", "Playable Path", 420),
@@ -489,6 +509,12 @@ class OtherWorkspaceFrame(ttk.Frame):
         if callable(ask_yes_no):
             return ask_yes_no(title, message, kind=kind)
         return ask_yes_no_dialog(self, title, message, kind=kind)
+
+    def _ask_yes_no_cancel_window(self, title: str, message: str, *, kind: str = "warning") -> bool | None:
+        ask_yes_no_cancel = getattr(self.app, "_ask_yes_no_cancel_window", None)
+        if callable(ask_yes_no_cancel):
+            return ask_yes_no_cancel(title, message, kind=kind)
+        return ask_yes_no_cancel_dialog(self, title, message, kind=kind)
 
     def _source_type_supports_replacement(self) -> bool:
         return self.source_type_var.get().strip() == AKPK_SOURCE_TYPE
@@ -664,7 +690,7 @@ class OtherWorkspaceFrame(ttk.Frame):
             return None
         if index in self._loading_gif_cache:
             return self._loading_gif_cache[index]
-        gif_path = application_root() / "assets" / "MovingGears.gif"
+        gif_path = bundled_resource_root() / "assets" / "MovingGears.gif"
         if not gif_path.exists():
             self._loading_gif_frame_count = 0
             return None
@@ -1174,23 +1200,25 @@ class OtherWorkspaceFrame(ttk.Frame):
     def _media_row_key(self, row: PckAudioRow) -> str:
         return row.row_key
 
-    def _media_leaf_values(self, row: PckAudioRow) -> tuple[str, str, str, str, str, str, str]:
+    def _media_leaf_values(self, row: PckAudioRow) -> tuple[str, str, str, str, str, str, str, str]:
         return (
             str(row.file_id),
             str(row.playable_offset),
             row.source_pack,
             row.row_kind,
+            _audio_type_text(row),
             str(row.duration_ms),
             str(row.sample_count_48k),
             str(row.cached_path),
         )
 
-    def _media_group_values(self, group: PckMediaGroup) -> tuple[str, str, str, str, str, str, str]:
+    def _media_group_values(self, group: PckMediaGroup) -> tuple[str, str, str, str, str, str, str, str]:
         return (
             "",
             "",
             _shared_text([row.source_pack for row in group.rows]),
             _shared_text([row.row_kind for row in group.rows]),
+            _shared_text([_audio_type_text(row) for row in group.rows]),
             str(group.duration_ms),
             str(group.sample_count),
             _media_signature_text(group.duration_ms, group.sample_count),
@@ -1356,6 +1384,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 f"Signature: {_media_signature_text(duration_ms, sample_count)}",
                 f"Source pack: {_shared_text([item.source_pack for item in rows])}",
                 f"Kind: {_shared_text([item.row_kind for item in rows])}",
+                f"Audio type: {_shared_text([_audio_type_text(item) for item in rows])}",
                 "",
                 "Members:",
             ]
@@ -1367,7 +1396,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 detail_lines.append(f"... {len(rows) - 200} more grouped file(s)")
         else:
             self.details_var.set(
-                f"ID {row.file_id}\nPack: {row.source_pack}\nKind: {row.row_kind}\nFile: {row.display_name}\nSignature: {_media_signature_text(duration_ms, sample_count)}"
+                f"ID {row.file_id}\nPack: {row.source_pack}\nKind: {row.row_kind}\nAudio Type: {_audio_type_text(row)}\nFile: {row.display_name}\nSignature: {_media_signature_text(duration_ms, sample_count)}"
             )
             detail_lines = [
                 f"File: {row.display_name}",
@@ -1375,6 +1404,10 @@ class OtherWorkspaceFrame(ttk.Frame):
                 f"Offset: {row.playable_offset}",
                 f"Source pack: {row.source_pack}",
                 f"Kind: {row.row_kind}",
+                f"Audio type: {_audio_type_text(row)}",
+                f"Type note: {row.audio_type_note or 'n/a'}",
+                f"Language: {row.language_name or 'n/a'}",
+                f"Resolved object types: {', '.join(str(value) for value in row.resolved_object_types) or 'n/a'}",
                 f"Duration: {duration_ms} ms",
                 f"Samples: {sample_count}",
                 f"Playable file: {row.cached_path}",
@@ -1480,6 +1513,88 @@ class OtherWorkspaceFrame(ttk.Frame):
         self._persist_settings()
         return resolved
 
+    def _ask_replacement_audio_type_mode(self, row: PckAudioRow) -> bool | None:
+        choice = self._ask_yes_no_cancel_window(
+            "Replace selected audio",
+            (
+                f"Current audio type: {_audio_type_text(row)}\n"
+                f"Kind: {row.row_kind}\n"
+                f"Language: {row.language_name or 'n/a'}\n\n"
+                "Yes keeps the same audio type intent.\n"
+                "No allows another audio type and triggers stronger compatibility warnings.\n"
+                "Cancel stops the replacement."
+            ),
+            kind="warning",
+        )
+        if choice is None:
+            self._append_status("Replacement cancelled before selecting a file.")
+            return None
+        return bool(choice)
+
+    def _resolve_sample_rate_replacement_choice(
+        self,
+        current_metadata: AudioMetadata | None,
+        replacement_metadata: AudioMetadata,
+    ) -> tuple[bool, int | None]:
+        if (
+            current_metadata is None
+            or current_metadata.detected_sample_rate <= 0
+            or replacement_metadata.detected_sample_rate <= 0
+            or current_metadata.detected_sample_rate == replacement_metadata.detected_sample_rate
+        ):
+            return True, None
+
+        choice = self._ask_yes_no_cancel_window(
+            "Sample rate mismatch",
+            (
+                f"Current audio sample rate: {current_metadata.detected_sample_rate} Hz\n"
+                f"Replacement sample rate: {replacement_metadata.detected_sample_rate} Hz\n\n"
+                "Yes automatically resamples the replacement to the current audio sample rate before conversion.\n"
+                "No keeps the replacement sample rate and continues anyway.\n"
+                "Cancel stops the replacement."
+            ),
+            kind="warning",
+        )
+        if choice is None:
+            self._append_status("Replacement cancelled due to sample rate mismatch.")
+            return False, None
+        if choice:
+            return True, current_metadata.detected_sample_rate
+        return True, None
+
+    def _replacement_warning_lines(
+        self,
+        row: PckAudioRow,
+        replacement_metadata: AudioMetadata,
+        current_metadata: AudioMetadata | None,
+        same_audio_type: bool,
+    ) -> list[str]:
+        lines: list[str] = []
+
+        if same_audio_type:
+            if row.audio_type == UNKNOWN_AUDIO_TYPE:
+                lines.append(
+                    "The current audio type could not be determined confidently, so same-type mode can only preserve the current pack slot and metadata checks."
+                )
+            return lines
+
+        if row.audio_type == MUSIC_TRACK_AUDIO_TYPE:
+            lines.append("This row looks music-related. Cross-type replacement can break music timing or layering expectations.")
+        elif row.audio_type == SOUND_VOICE_AUDIO_TYPE:
+            lines.append("This row looks voice-related. Cross-type replacement can break spoken-line or localization expectations.")
+        else:
+            lines.append("Cross-type replacement keeps the same pack slot but may not match the original Wwise authoring intent.")
+
+        if row.language_name and row.language_name.casefold() not in {"", "default", "none", "sfx", "sound"}:
+            lines.append(f"This row has localized language context: {row.language_name}.")
+        if row.row_kind == "embedded_bank_media":
+            lines.append("This media is embedded inside a bank payload, which is more sensitive to authoring mismatches.")
+        elif row.row_kind == "linked_bank_media":
+            lines.append("This media is referenced by bank logic, so a cross-type replacement may conflict with the original graph.")
+        if row.audio_type_note:
+            lines.append(f"Detection note: {row.audio_type_note}")
+        return lines
+
     def _replace_selected_media(self) -> None:
         if not self.enable_replace_audio_var.get():
             self._show_info_window("Replace selected audio", "Enable the experimental AKPK replacement toggle first.")
@@ -1494,6 +1609,9 @@ class OtherWorkspaceFrame(ttk.Frame):
                 "Select exactly one media row to replace. Group rows and multi-select replacements are not supported yet.",
             )
             return
+        same_audio_type = self._ask_replacement_audio_type_mode(row)
+        if same_audio_type is None:
+            return
 
         selection = filedialog.askopenfilename(
             title=f"Replace {row.display_name}",
@@ -1507,9 +1625,21 @@ class OtherWorkspaceFrame(ttk.Frame):
         except Exception as exc:
             self._show_error_window("Replace selected audio failed", f"Could not inspect the selected audio. {exc}")
             return
+        current_metadata: AudioMetadata | None = None
+        try:
+            current_metadata = probe_audio_metadata(row.cached_path)
+        except Exception:
+            current_metadata = None
+        should_continue, target_sample_rate = self._resolve_sample_rate_replacement_choice(current_metadata, replacement_metadata)
+        if not should_continue:
+            return
         self.preview_player.environment = discover_media_tools()
         self.preview_tools_var.set(self.preview_player.environment.summary())
-        missing_tools = missing_wem_conversion_requirements(replacement_path, self.preview_player.environment)
+        missing_tools = missing_wem_conversion_requirements(
+            replacement_path,
+            self.preview_player.environment,
+            target_sample_rate=target_sample_rate,
+        )
         if missing_tools:
             layout = ensure_portable_tool_layout()
             details = [
@@ -1521,6 +1651,7 @@ class OtherWorkspaceFrame(ttk.Frame):
                 f"Portable tools folder: {layout['root']}",
                 f"Wwise drop folder: {layout['wwise']}",
                 f"FFmpeg drop folder: {layout['ffmpeg']}",
+                f"vgmstream drop folder: {layout['vgmstream']}",
                 "",
                 "For portable Wwise, preserve the Authoring layout:",
                 "tools/wwise/Authoring/Data",
@@ -1537,6 +1668,16 @@ class OtherWorkspaceFrame(ttk.Frame):
                 os.startfile(str(layout["root"]))
             self._append_status("Replacement cancelled until portable conversion tools are available.")
             return
+        warning_lines = self._replacement_warning_lines(row, replacement_metadata, current_metadata, same_audio_type)
+        if warning_lines:
+            should_continue = self._ask_yes_no_window(
+                "Replacement compatibility warning",
+                "\n\n".join(warning_lines + ["Continue with this replacement?"]),
+                kind="warning",
+            )
+            if not should_continue:
+                self._append_status("Replacement cancelled after compatibility warnings.")
+                return
         if row.duration_ms > 0 and replacement_metadata.duration_ms > 0:
             duration_delta = abs(replacement_metadata.duration_ms - row.duration_ms)
             if duration_delta > 5:
@@ -1571,13 +1712,17 @@ class OtherWorkspaceFrame(ttk.Frame):
 
         def worker(progress, log):
             normalized_replacement_path = replacement_path
-            if replacement_path.suffix.lower() != ".wem":
+            if replacement_path.suffix.lower() != ".wem" or target_sample_rate is not None:
                 if progress is not None:
-                    progress(f"Converting {replacement_path.name} to WEM...", 0, 3)
+                    if target_sample_rate is not None:
+                        progress(f"Converting and resampling {replacement_path.name} to WEM...", 0, 3)
+                    else:
+                        progress(f"Converting {replacement_path.name} to WEM...", 0, 3)
                 normalized_replacement_path = convert_audio_to_wem(
                     replacement_path,
                     conversion_root,
                     log=log,
+                    target_sample_rate=target_sample_rate,
                 )
             replacement_result = replace_pck_audio_row(
                 index,

@@ -4,6 +4,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def entry_type_from_channel_count(channel_count: int) -> int:
+    return channel_count if channel_count > 0 else 2
+
+
+def format_entry_type(entry_type: int) -> str:
+    if entry_type == 1:
+        return "Mono"
+    if entry_type == 2:
+        return "Stereo"
+    if entry_type > 0:
+        return f"{entry_type} channels"
+    return str(entry_type)
+
+
 @dataclass(slots=True)
 class AudioEntry:
     entry_name: str

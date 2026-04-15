@@ -16,6 +16,7 @@ from typing import Callable
 
 from dyingaudio.background import TaskCancelled
 from dyingaudio.core.media_tools import run_hidden
+from dyingaudio.core.wwise_audio_type import infer_audio_type, normalize_object_types
 from dyingaudio.core.wwise_workspace import ExtractedBank, NamedAudioLink, UnresolvedAudioLink
 
 
@@ -370,6 +371,145 @@ def resolve_object_media(
     return unique
 
 
+def _merge_media_detail_maps(target: dict[int, set[int]], incoming: dict[int, tuple[int, ...]]) -> None:
+    for media_id, object_types in incoming.items():
+        bucket = target.setdefault(media_id, set())
+        bucket.update(normalize_object_types(object_types))
+
+
+def resolve_object_media_details(
+    object_id: int,
+    local_objects: dict[int, HircObject],
+    global_objects: dict[int, HircObject],
+    known_object_ids: set[int],
+    global_media: dict[int, list[MediaInfo]],
+    memo: dict[int, dict[int, tuple[int, ...]]],
+    stack: set[int],
+    cancel_event: threading.Event | None = None,
+) -> dict[int, tuple[int, ...]]:
+    _raise_if_cancelled(cancel_event)
+    if object_id in memo:
+        return {media_id: tuple(object_types) for media_id, object_types in memo[object_id].items()}
+    if object_id in stack:
+        return {}
+    stack.add(object_id)
+
+    obj = local_objects.get(object_id) or global_objects.get(object_id)
+    merged: dict[int, set[int]] = {}
+    if obj is not None:
+        payload = obj.payload
+        if obj.object_type == 2:
+            for media_id in get_sound_media(payload, global_media):
+                merged[media_id] = {2}
+        elif obj.object_type == 11:
+            for media_id in get_music_track_media(payload, global_media):
+                merged[media_id] = {11}
+        elif obj.object_type == 3:
+            target = get_action_target(payload, known_object_ids)
+            if target is not None:
+                _merge_media_detail_maps(
+                    merged,
+                    resolve_object_media_details(
+                        target,
+                        local_objects,
+                        global_objects,
+                        known_object_ids,
+                        global_media,
+                        memo,
+                        stack,
+                        cancel_event,
+                    ),
+                )
+            if not merged and len(payload) >= 2 and payload[1] == 0x12:
+                lookup_keys = get_action_lookup_keys(payload)
+                for child_id in get_state_mapped_children(local_objects, lookup_keys, known_object_ids):
+                    _raise_if_cancelled(cancel_event)
+                    _merge_media_detail_maps(
+                        merged,
+                        resolve_object_media_details(
+                            child_id,
+                            local_objects,
+                            global_objects,
+                            known_object_ids,
+                            global_media,
+                            memo,
+                            stack,
+                            cancel_event,
+                        ),
+                    )
+        elif obj.object_type == 4:
+            for action_id in get_event_actions(payload):
+                _raise_if_cancelled(cancel_event)
+                _merge_media_detail_maps(
+                    merged,
+                    resolve_object_media_details(
+                        action_id,
+                        local_objects,
+                        global_objects,
+                        known_object_ids,
+                        global_media,
+                        memo,
+                        stack,
+                        cancel_event,
+                    ),
+                )
+        elif obj.object_type == 5:
+            child_ids = get_tail_children(payload, known_object_ids) or get_any_object_refs(payload, known_object_ids)
+            for child_id in child_ids:
+                _raise_if_cancelled(cancel_event)
+                _merge_media_detail_maps(
+                    merged,
+                    resolve_object_media_details(
+                        child_id,
+                        local_objects,
+                        global_objects,
+                        known_object_ids,
+                        global_media,
+                        memo,
+                        stack,
+                        cancel_event,
+                    ),
+                )
+        elif obj.object_type in {7, 10, 12, 13}:
+            child_ids = get_tail_children(payload, known_object_ids) if obj.object_type == 7 else get_any_object_refs(payload, known_object_ids)
+            for child_id in child_ids:
+                _raise_if_cancelled(cancel_event)
+                _merge_media_detail_maps(
+                    merged,
+                    resolve_object_media_details(
+                        child_id,
+                        local_objects,
+                        global_objects,
+                        known_object_ids,
+                        global_media,
+                        memo,
+                        stack,
+                        cancel_event,
+                    ),
+                )
+        else:
+            for child_id in get_tail_children(payload, known_object_ids):
+                _raise_if_cancelled(cancel_event)
+                _merge_media_detail_maps(
+                    merged,
+                    resolve_object_media_details(
+                        child_id,
+                        local_objects,
+                        global_objects,
+                        known_object_ids,
+                        global_media,
+                        memo,
+                        stack,
+                        cancel_event,
+                    ),
+                )
+
+    stack.remove(object_id)
+    normalized = {media_id: tuple(sorted(object_types)) for media_id, object_types in merged.items()}
+    memo[object_id] = normalized
+    return {media_id: tuple(object_types) for media_id, object_types in normalized.items()}
+
+
 def get_bank_media_links(
     bank: ParsedBank,
     preloads_by_name: dict[str, PreloadInfo],
@@ -377,7 +517,7 @@ def get_bank_media_links(
     global_objects: dict[int, HircObject],
     global_media: dict[int, list[MediaInfo]],
     cancel_event: threading.Event | None = None,
-) -> list[tuple[str, str, int, MediaInfo]]:
+) -> list[tuple[str, str, int, MediaInfo, tuple[int, ...]]]:
     _raise_if_cancelled(cancel_event)
     if bank.name is None or bank.name not in preloads_by_name:
         return []
@@ -386,15 +526,15 @@ def get_bank_media_links(
     if not event_names:
         return []
 
-    memo: dict[int, list[int]] = {}
-    links: list[tuple[str, str, int, MediaInfo]] = []
+    memo: dict[int, dict[int, tuple[int, ...]]] = {}
+    links: list[tuple[str, str, int, MediaInfo, tuple[int, ...]]] = []
     local_known_object_ids = set(bank.objects.keys())
     for event_name in event_names:
         _raise_if_cancelled(cancel_event)
         event_hash = fnv1_lower(event_name)
         if event_hash not in bank.objects:
             continue
-        media_ids = resolve_object_media(
+        media_details = resolve_object_media_details(
             event_hash,
             bank.objects,
             global_objects,
@@ -404,14 +544,14 @@ def get_bank_media_links(
             set(),
             cancel_event,
         )
-        for media_id in sorted(media_ids):
+        for media_id in sorted(media_details):
             _raise_if_cancelled(cancel_event)
             infos = list(global_media.get(media_id, []))
             if not infos:
                 continue
             existing_infos = [info for info in infos if info.exists]
             for info in (existing_infos or infos):
-                links.append((bank.name, event_name, media_id, info))
+                links.append((bank.name, event_name, media_id, info, media_details.get(media_id, ())))
     return links
 
 
@@ -728,15 +868,15 @@ def build_named_audio_tree(
                 bank_unresolved.append(UnresolvedAudioLink(bank=bank.name or "", event="", media_id=None, note="No mapped event media found"))
                 return BankLinkResult(bank_index=bank_index, bank_name=display_name, named_links=bank_named_links, unresolved=bank_unresolved)
 
-            grouped_by_event: dict[tuple[str, str], list[tuple[str, str, int, MediaInfo]]] = defaultdict(list)
-            for bank_name, event_name, media_id, info in links:
-                grouped_by_event[(bank_name, event_name)].append((bank_name, event_name, media_id, info))
+            grouped_by_event: dict[tuple[str, str], list[tuple[str, str, int, MediaInfo, tuple[int, ...]]]] = defaultdict(list)
+            for bank_name, event_name, media_id, info, object_types in links:
+                grouped_by_event[(bank_name, event_name)].append((bank_name, event_name, media_id, info, object_types))
 
             for (bank_name, event_name), group in grouped_by_event.items():
                 _raise_if_cancelled(cancel_event)
                 bank_folder = get_safe_segment(bank_name, max_length=64)
                 event_folder = get_safe_segment(event_name, max_length=96)
-                grouped_by_archive: dict[str, list[tuple[str, str, int, MediaInfo]]] = defaultdict(list)
+                grouped_by_archive: dict[str, list[tuple[str, str, int, MediaInfo, tuple[int, ...]]]] = defaultdict(list)
                 for item in group:
                     grouped_by_archive[item[3].archive].append(item)
                 for archive_name, archive_group in grouped_by_archive.items():
@@ -744,7 +884,7 @@ def build_named_audio_tree(
                     event_dir = tree_root / archive_name / bank_folder / event_folder
                     event_dir_created = False
                     sorted_media = sorted(archive_group, key=lambda item: item[2])
-                    for media_index, (_, _, media_id, info) in enumerate(sorted_media):
+                    for media_index, (_, _, media_id, info, object_types) in enumerate(sorted_media):
                         _raise_if_cancelled(cancel_event)
                         leaf = f"media_{media_id}.wav" if len(sorted_media) == 1 else f"{media_index + 1:03d}__media_{media_id}.wav"
                         target_path = event_dir / leaf
@@ -778,6 +918,12 @@ def build_named_audio_tree(
                             ensure_directory(event_dir)
                             event_dir_created = True
                         create_hard_link_safe(target_path, info.source)
+                        resolution = infer_audio_type(
+                            object_types=object_types,
+                            archive_name=archive_name,
+                            bank_name=bank_name,
+                            event_name=event_name,
+                        )
                         bank_named_links.append(
                             NamedAudioLink(
                                 archive=archive_name,
@@ -786,6 +932,10 @@ def build_named_audio_tree(
                                 media_id=media_id,
                                 source=info.source,
                                 link=target_path,
+                                resolved_object_types=normalize_object_types(object_types),
+                                audio_type=resolution.audio_type,
+                                audio_type_confidence=resolution.confidence,
+                                audio_type_note=resolution.note,
                             )
                         )
             return BankLinkResult(bank_index=bank_index, bank_name=display_name, named_links=bank_named_links, unresolved=bank_unresolved)
@@ -872,7 +1022,21 @@ def build_named_audio_tree(
     banks_manifest_path = logs_root / "extracted_banks_manifest.csv"
 
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("archive", "bank", "event", "media_id", "source", "link"))
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "archive",
+                "bank",
+                "event",
+                "media_id",
+                "source",
+                "link",
+                "object_types",
+                "audio_type",
+                "audio_type_confidence",
+                "audio_type_note",
+            ),
+        )
         writer.writeheader()
         for row in named_links:
             writer.writerow(
@@ -883,6 +1047,10 @@ def build_named_audio_tree(
                     "media_id": row.media_id,
                     "source": row.source,
                     "link": row.link,
+                    "object_types": "|".join(str(value) for value in row.resolved_object_types),
+                    "audio_type": row.audio_type,
+                    "audio_type_confidence": row.audio_type_confidence,
+                    "audio_type_note": row.audio_type_note,
                 }
             )
 

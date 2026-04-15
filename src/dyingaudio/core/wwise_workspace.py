@@ -15,7 +15,13 @@ from typing import Callable
 
 from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.background import TaskCancelled
-from dyingaudio.core.media_tools import discover_media_tools
+from dyingaudio.core.media_tools import decode_audio_to_wav, discover_media_tools
+from dyingaudio.core.wwise_audio_type import (
+    CONFIDENCE_UNKNOWN,
+    UNKNOWN_AUDIO_TYPE,
+    infer_audio_type,
+    normalize_object_types,
+)
 
 
 DL2_GAME = "DL2"
@@ -31,6 +37,7 @@ GAME_LABELS = {
     DL2_GAME: "Dying Light 2",
     DLTB_GAME: "Dying Light The Beast",
 }
+WORKSPACE_SCHEMA_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -60,6 +67,10 @@ class NamedAudioLink:
     media_id: int
     source: Path
     link: Path
+    resolved_object_types: tuple[int, ...] = ()
+    audio_type: str = UNKNOWN_AUDIO_TYPE
+    audio_type_confidence: str = CONFIDENCE_UNKNOWN
+    audio_type_note: str = ""
 
 
 @dataclass(slots=True)
@@ -198,6 +209,7 @@ def workspace_root_for(cache_root: str | Path, game: str, archive_set: str, fing
 
 def _workspace_metadata_payload(game: str, archive_set: str, bundle: ArchiveBundle, fingerprint: str) -> dict[str, object]:
     return {
+        "schema_version": WORKSPACE_SCHEMA_VERSION,
         "game": game,
         "archive_set": archive_set,
         "fingerprint": fingerprint,
@@ -223,6 +235,25 @@ def _parse_int(value: str | None) -> int:
         return int(value or 0)
     except ValueError:
         return 0
+
+
+def _parse_object_types(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    return normalize_object_types(part.strip() for part in value.replace(",", "|").split("|") if part.strip())
+
+
+def _decorate_named_link_audio_type(link: NamedAudioLink, archive_set: str) -> None:
+    resolution = infer_audio_type(
+        object_types=link.resolved_object_types,
+        archive_set=archive_set,
+        archive_name=link.archive,
+        bank_name=link.bank,
+        event_name=link.event,
+    )
+    link.audio_type = resolution.audio_type
+    link.audio_type_confidence = resolution.confidence
+    link.audio_type_note = resolution.note
 
 
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -277,23 +308,27 @@ def warm_media_signature_cache(
     return len(unique_paths)
 
 
-def _load_named_links(path: Path) -> list[NamedAudioLink]:
+def _load_named_links(path: Path, archive_set: str) -> list[NamedAudioLink]:
     if not path.exists():
         return []
     entries: list[NamedAudioLink] = []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            entries.append(
-                NamedAudioLink(
-                    archive=row.get("archive", ""),
-                    bank=row.get("bank", ""),
-                    event=row.get("event", ""),
-                    media_id=_parse_int(row.get("media_id")),
-                    source=Path(row.get("source", "")).resolve(),
-                    link=Path(row.get("link", "")).resolve(),
-                )
+            link = NamedAudioLink(
+                archive=row.get("archive", ""),
+                bank=row.get("bank", ""),
+                event=row.get("event", ""),
+                media_id=_parse_int(row.get("media_id")),
+                source=Path(row.get("source", "")).resolve(),
+                link=Path(row.get("link", "")).resolve(),
+                resolved_object_types=_parse_object_types(row.get("object_types")),
+                audio_type=str(row.get("audio_type", UNKNOWN_AUDIO_TYPE) or UNKNOWN_AUDIO_TYPE),
+                audio_type_confidence=str(row.get("audio_type_confidence", CONFIDENCE_UNKNOWN) or CONFIDENCE_UNKNOWN),
+                audio_type_note=str(row.get("audio_type_note", "") or ""),
             )
+            _decorate_named_link_audio_type(link, archive_set)
+            entries.append(link)
     return entries
 
 
@@ -349,7 +384,7 @@ def load_workspace(root: str | Path) -> WwiseWorkspace:
         sfx_path=Path(metadata["sfx_path"]).resolve(),
         streams_path=Path(metadata["streams_path"]).resolve(),
     )
-    named_links = _load_named_links(logs_root / "named_tree_manifest.csv")
+    named_links = _load_named_links(logs_root / "named_tree_manifest.csv", bundle.archive_set)
     extracted_banks = _load_extracted_banks(logs_root / "extracted_banks_manifest.csv")
     unresolved = _load_unresolved(logs_root / "named_tree_unresolved.csv")
     summary_text = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
@@ -394,10 +429,17 @@ def build_or_load_workspace(
     manifest_path = logs_root / "named_tree_manifest.csv"
     banks_manifest_path = logs_root / "extracted_banks_manifest.csv"
     unresolved_path = logs_root / "named_tree_unresolved.csv"
+    metadata_current = False
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata_current = int(metadata.get("schema_version", 0)) == WORKSPACE_SCHEMA_VERSION
+        except (OSError, TypeError, ValueError):
+            metadata_current = False
 
     if (
         not force_rebuild
-        and metadata_path.exists()
+        and metadata_current
         and manifest_path.exists()
         and banks_manifest_path.exists()
         and unresolved_path.exists()
@@ -505,16 +547,40 @@ def export_media_files(
 ) -> list[Path]:
     destination_root_path = Path(destination_root).resolve()
     destination_root_path.mkdir(parents=True, exist_ok=True)
+    tools = discover_media_tools()
+    used_names: set[str] = set()
     exported: list[Path] = []
     total = max(len(rows), 1)
     for index, row in enumerate(rows):
         _raise_if_cancelled(cancel_event)
-        destination = destination_root_path / row.link.name
-        shutil.copy2(row.link, destination)
+        source = row.link if row.link.exists() else row.source
+        destination = destination_root_path / _named_audio_export_name(row, used_names)
+        decode_audio_to_wav(source, destination, tools=tools)
         exported.append(destination)
         if progress is not None:
-            progress(f"Exporting {row.link.name}", index + 1, total)
+            progress(f"Exporting {destination.name}", index + 1, total)
     return exported
+
+
+def _sanitize_export_stem(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in {"_", "-", "."} else "_" for character in value)
+    return safe.strip("._") or "audio"
+
+
+def _dedupe_export_name(base_stem: str, used_names: set[str]) -> str:
+    stem = _sanitize_export_stem(base_stem)
+    candidate = f"{stem}.wav"
+    counter = 2
+    while candidate.casefold() in used_names:
+        candidate = f"{stem}_{counter}.wav"
+        counter += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def _named_audio_export_name(row: NamedAudioLink, used_names: set[str]) -> str:
+    base = f"{row.archive}__{row.bank}__{row.event}__media_{row.media_id}"
+    return _dedupe_export_name(base, used_names)
 
 
 def event_directory(workspace: WwiseWorkspace, archive: str, bank: str, event: str) -> Path:

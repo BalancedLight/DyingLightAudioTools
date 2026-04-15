@@ -2,16 +2,15 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks.tcl_tk import tcltk_info
-
 project_root = Path.cwd()
 src_root = project_root / "src"
+assets_root = project_root / "assets"
 
-if not tcltk_info.available:
-    raise SystemExit(
-        "PyInstaller could not discover Tcl/Tk data for this build environment. "
-        "Build with a standard Windows Python installation that includes working tkinter/Tcl/Tk files."
-    )
+asset_datas = [
+    (str(path), str(Path("assets") / path.relative_to(assets_root).parent))
+    for path in sorted(assets_root.rglob("*"))
+    if path.is_file()
+]
 
 block_cipher = None
 
@@ -19,10 +18,7 @@ a = Analysis(
     [str(src_root / "dyingaudio" / "__main__.py")],
     pathex=[str(src_root)],
     binaries=[],
-    datas=[
-        (str(project_root / "assets" / "dyinglight_devtools.ico"), "assets"),
-        *[(src, dest) for dest, src, _typecode in tcltk_info.data_files],
-    ],
+    datas=asset_datas,
     hiddenimports=[
         "tkinter",
         "tkinter.filedialog",

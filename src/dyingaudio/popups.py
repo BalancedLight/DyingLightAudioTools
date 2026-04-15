@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import tkinter as tk
 from tkinter import ttk
 
-from dyingaudio.settings import application_root, is_windows_dark_mode
+from dyingaudio.settings import bundled_resource_root, is_windows_dark_mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +27,7 @@ def _maybe_beep(kind: str) -> None:
 
 
 def _load_icon(window: tk.Toplevel, kind: str) -> tk.PhotoImage | None:
-    icon_path = application_root() / "assets" / f"{kind}.png"
+    icon_path = bundled_resource_root() / "assets" / f"{kind}.png"
     if not icon_path.exists():
         return None
     try:

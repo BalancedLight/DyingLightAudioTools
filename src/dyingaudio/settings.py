@@ -131,6 +131,13 @@ def application_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def bundled_resource_root() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass).resolve()
+    return application_root()
+
+
 def settings_path() -> Path:
     return application_root() / "settings.json"
 

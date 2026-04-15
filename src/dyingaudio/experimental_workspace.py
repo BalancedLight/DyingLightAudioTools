@@ -12,6 +12,7 @@ from typing import Callable
 
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
 from dyingaudio.core.preview import PreviewPlayer
+from dyingaudio.core.wwise_audio_type import audio_type_label
 from dyingaudio.core.wwise_workspace import (
     BASE_ARCHIVE_SET,
     DL2_GAME,
@@ -36,13 +37,24 @@ from dyingaudio.settings import (
     DEFAULT_EXPERIMENTAL_CACHE_ROOT,
     DEFAULT_EXPERIMENTAL_GAME,
     ExperimentalSettings,
-    application_root,
+    bundled_resource_root,
     discover_game_root,
     is_windows_dark_mode,
 )
 
 
-MEDIA_SORT_FIELDS = ("Original Order", "Media ID", "File", "Archive", "Bank", "Event", "Duration", "Samples", "Source")
+MEDIA_SORT_FIELDS = (
+    "Original Order",
+    "Media ID",
+    "File",
+    "Archive",
+    "Bank",
+    "Event",
+    "Audio Type",
+    "Duration",
+    "Samples",
+    "Source",
+)
 
 
 @dataclass(slots=True)
@@ -87,6 +99,10 @@ def _shared_text(values: list[str]) -> str:
 
 def _media_signature_text(duration_ms: int, sample_count: int) -> str:
     return f"{duration_ms} ms / {sample_count} samples"
+
+
+def _audio_type_text(row: NamedAudioLink) -> str:
+    return audio_type_label(row.audio_type, row.audio_type_confidence)
 
 
 def matching_audio_group_rows(rows: list[NamedAudioLink]) -> list[NamedAudioLink]:
@@ -143,6 +159,8 @@ def filter_and_sort_media_rows(
             or normalized_search in row.archive.lower()
             or normalized_search in row.bank.lower()
             or normalized_search in row.event.lower()
+            or normalized_search in _audio_type_text(row).lower()
+            or normalized_search in row.audio_type_note.lower()
             or normalized_search in str(row.source).lower()
             or normalized_search in str(row.link).lower()
             or (needs_signature and (normalized_search in str(duration_ms).lower() or normalized_search in str(sample_count).lower()))
@@ -155,6 +173,7 @@ def filter_and_sort_media_rows(
             "Archive": lambda pair: pair[1].archive.lower(),
             "Bank": lambda pair: pair[1].bank.lower(),
             "Event": lambda pair: pair[1].event.lower(),
+            "Audio Type": lambda pair: _audio_type_text(pair[1]).lower(),
             "Duration": lambda pair: pair[2],
             "Samples": lambda pair: pair[3],
             "Source": lambda pair: str(pair[1].link).lower(),
@@ -353,7 +372,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
         self.media_tree = ttk.Treeview(
             media_tree_frame,
-            columns=("media_id", "archive", "bank", "event", "duration", "samples", "source"),
+            columns=("media_id", "archive", "bank", "event", "audio_type", "duration", "samples", "source"),
             show="tree headings",
             height=18,
         )
@@ -368,6 +387,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             ("archive", "Archive", 90),
             ("bank", "Bank", 140),
             ("event", "Event", 160),
+            ("audio_type", "Audio Type", 150),
             ("duration", "Duration (ms)", 110),
             ("samples", "Samples", 100),
             ("source", "Playable Path", 420),
@@ -512,7 +532,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             return None
         if index in self._loading_gif_cache:
             return self._loading_gif_cache[index]
-        gif_path = application_root() / "assets" / "MovingGears.gif"
+        gif_path = bundled_resource_root() / "assets" / "MovingGears.gif"
         if not gif_path.exists():
             self._loading_gif_frame_count = 0
             return None
@@ -1093,24 +1113,26 @@ class ExperimentalWwiseFrame(ttk.Frame):
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
-    def _media_leaf_values(self, row: NamedAudioLink) -> tuple[str, str, str, str, str, str, str]:
+    def _media_leaf_values(self, row: NamedAudioLink) -> tuple[str, str, str, str, str, str, str, str]:
         duration_ms, sample_count = _media_signature_for_row(row)
         return (
             str(row.media_id),
             row.archive,
             row.bank,
             row.event,
+            _audio_type_text(row),
             str(duration_ms),
             str(sample_count),
             str(row.link),
         )
 
-    def _media_group_values(self, group: MediaGroup) -> tuple[str, str, str, str, str, str, str]:
+    def _media_group_values(self, group: MediaGroup) -> tuple[str, str, str, str, str, str, str, str]:
         return (
             "",
             _shared_text([row.archive for row in group.rows]),
             _shared_text([row.bank for row in group.rows]),
             _shared_text([row.event for row in group.rows]),
+            _shared_text([_audio_type_text(row) for row in group.rows]),
             str(group.duration_ms),
             str(group.sample_count),
             _media_signature_text(group.duration_ms, group.sample_count),
@@ -1311,6 +1333,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 f"Archive: {_shared_text([item.archive for item in rows])}",
                 f"Bank: {_shared_text([item.bank for item in rows])}",
                 f"Event: {_shared_text([item.event for item in rows])}",
+                f"Audio type: {_shared_text([_audio_type_text(item) for item in rows])}",
                 "",
                 "Members:",
             ]
@@ -1320,13 +1343,16 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 detail_lines.append(f"... {len(rows) - 200} more grouped file(s)")
         else:
             self.details_var.set(
-                f"Media {row.media_id}\nArchive: {row.archive}\nBank: {row.bank}\nEvent: {row.event}\nFile: {row.link.name}\nSignature: {_media_signature_text(duration_ms, sample_count)}"
+                f"Media {row.media_id}\nArchive: {row.archive}\nBank: {row.bank}\nEvent: {row.event}\nAudio Type: {_audio_type_text(row)}\nFile: {row.link.name}\nSignature: {_media_signature_text(duration_ms, sample_count)}"
             )
             detail_lines = [
                 f"Archive: {row.archive}",
                 f"Bank: {row.bank}",
                 f"Event: {row.event}",
                 f"Media ID: {row.media_id}",
+                f"Audio type: {_audio_type_text(row)}",
+                f"Type note: {row.audio_type_note or 'n/a'}",
+                f"Resolved object types: {', '.join(str(value) for value in row.resolved_object_types) or 'n/a'}",
                 f"Duration: {duration_ms} ms",
                 f"Samples: {sample_count}",
                 f"Playable file: {row.link}",

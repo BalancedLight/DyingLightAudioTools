@@ -1,64 +1,115 @@
-# DyingAudio: The Definitive Dying Light Series Audio Tool
+# DyingAudio
 
-## Note: Most code here was generated with AI. Please proceed with caution.
+Windows-first Python GUI tools for working with Dying Light series audio.
 
-DyingAudio is a Windows-first Python GUI for Dying Light audio work.
+## Current Workspaces
 
-It now ships with two main workspaces:
+- `Dying Light 1`: edit `.csb` bundles, mix raw audio and existing `.fsb` files, preview entries, save rebuilt banks, and build mods
+- `Dying Light 2 / The Beast (Experimental)`: read-only Wwise browser for named trees, preview, and export
+- `Other`: read-only AKPK / `.pck` browser with preview, export, and experimental replacement tools
 
-- `Dying Light 1`: the current CSB/FSB editor for Dying Light 1 mods
-- `Dying Light 2 / The Beast (Experimental)`: a read-only Wwise browser for generating named trees, previewing audio, and exporting organized dumps
+## First-Time Setup
 
-## Dying Light 1
+1. Install a normal Windows Python build with `tkinter` support. Python from the Microsoft Store alias alone is usually not enough.
+2. Open the app once and let it remember your paths in `settings.json`.
+3. For DL1 raw-audio builds, point `DLDT Root` at the Dying Light Developer Tools folder.
+4. For DL1 mod output, point `Mods Root` at your Dying Light `Mods` folder.
 
-The DL1 tab supports:
-
-- opening an existing `.csb` into the editor and replacing individual bank entries
-- importing raw `.ogg`, `.wav`, `.mp3`, `.flac`, `.m4a`, `.aac`, `.wma`, `.opus`, and similar files
-- mixing raw audio entries with existing `.fsb` entries in the same project
-- searching and sorting the current entry list inside the editor
-- using a right-click menu on entries for replace, export, duplicate, rename, and remove actions
-- previewing selected audio entries from raw files or extracted `.fsb` banks
-- caching decoded preview audio in temp storage for faster repeat playback
-- compiling `.fsb` banks with the installed Dying Light Developer Tools
-- packing `.csb` bundles with an internal writer
-- inspecting and extracting existing `.csb` bundles
-- generating a placeholder `audiodata.scr` that loads a chosen bank in every listed `AudioProc`
-- exporting a full mod folder into a selectable `Mods` root
-- saving the edited result directly to a chosen `.csb` file, including overwriting the opened bank
-
-## Dying Light 2 / The Beast (Experimental)
-
-The experimental tab supports:
-
-- switching between `DL2` and `DLTB` roots in one shared Wwise-family workspace
-- detecting `base` and available `speech_*` archive sets from the selected game install
-- extracting the embedded `<Mapping>` XML directly from `meta*.aesp`
-- generating and caching a named workspace under `%LOCALAPPDATA%\\DyingAudio\\wwise_cache`
-- browsing `archive -> bank -> event` groups with media rows in the center pane
-- previewing generated WAV files directly from the cached workspace
-- exporting selected media, selected event folders, selected bank files, or a full workspace dump
-
-The experimental workspace is intentionally read-only in v1. It does not edit or rebuild Wwise banks yet.
-
-## Running From Source
-
-You need a real Python install on Windows. The Microsoft Store alias alone is not enough.
+You can run from source with:
 
 ```powershell
-set PYTHONPATH=.\src
+python -m pip install -e .
 python -m dyingaudio
 ```
 
-Or use:
+Or with the included helper:
 
 ```powershell
 .\run_dyingaudio.bat
 ```
 
+## Dying Light 1 Quick Start
+
+### Requirements
+
+For some editing behaviour, you will need to have **Dying Light Developer Tools** installed. 
+
+### Create a new DL1 audio project
+
+1. Open the `Dying Light 1` tab.
+2. Click `Add Audio / FSB`.
+3. Pick raw audio files, `.fsb` files, or a mix of both in the same browse dialog.
+4. Select an entry in the list to review it in `Selected Entry`.
+5. Click `Apply Entry Changes` after editing any fields.
+6. Use `Save CSB File` to write a standalone bank, or `Build Mod` to create a mod folder.
+
+### Edit an existing `.csb`
+
+1. Click `Open CSB For Edit`.
+2. Select the entry you want to change.
+3. Click `Replace Audio / FSB`.
+4. Choose a raw audio file or an `.fsb`.
+5. Preview, adjust entry details if needed, then save or build.
+
+
+### Selected Entry behavior
+
+- If you change selection while the current entry has unapplied edits, DyingAudio will ask whether to apply, discard, or keep editing.
+- Press `Enter` inside an editable field or click `Apply Entry Changes` to commit the change.
+
+### Builder Modes
+
+- `Raw Audio via DLDT`: use this when any entry comes from raw audio and must be compiled into FSB during build/save
+- `Existing FSB Files`: use this when every entry already points at ready-made `.fsb` content
+
+Replacing or adding raw audio keeps the project in raw-audio mode because DLDT is required to compile those files.
+
+### Useful DL1 actions
+
+- `Preview`: play the selected entry directly from the source file or extracted FSB data
+- `Inspect CSB`: view entry names, channel info, duration, samples, and notes without opening for edit
+- `Extract CSB`: unpack embedded FSBs from an existing bundle
+- Right-click an entry for replace, export, duplicate, rename, or remove
+- Search and sort the entry list without losing the original underlying entry indices
+
+## Dying Light 2 / The Beast (Experimental)
+
+This workspace is intentionally read-only right now.
+
+It supports:
+
+- switching between `DL2` and `DLTB`
+- detecting available archive sets such as `base` and `speech_*`
+- building a cached named workspace under `%LOCALAPPDATA%\DyingAudio\wwise_cache`
+- browsing `archive -> bank -> event`
+- previewing and exporting selected media
+- exporting selected event folders, selected bank files, or a full workspace dump
+
+## Other Workspace
+
+The `Other` tab targets AKPK / `.pck` packs.
+
+It supports:
+
+- building or refreshing a cached browser workspace
+- browsing packs and media rows
+- previewing and exporting selected media
+- exporting mixed audio where supported
+- optional experimental AKPK replacement tools via local Wwise installation
+
+## Notes
+
+- Default experimental cache root: `%LOCALAPPDATA%\DyingAudio\wwise_cache`
+- The app remembers install roots, cache roots, and last-used output paths in `settings.json`
+- If a path box is empty, `Browse` first tries auto-discovery before falling back to manual selection
+- Raw formats beyond `.wav` and `.ogg` can use FFmpeg for preview/build helpers when available
+- Preview prefers direct playback tools when possible and falls back to cached WAV generation when needed
+- Retail `DW\Data` banks using CSB magic `0x00000002` are supported for inspect, edit, and save
+- Dark mode combobox dropdowns are styled for readability across the app
+
 ## Packaging
 
-The project includes:
+This repo includes:
 
 - `DyingAudio.spec`
 - `scripts\build_exe.ps1`
@@ -69,21 +120,6 @@ After installing PyInstaller:
 pwsh -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 ```
 
-> The build requires a Windows Python installation with Tcl/Tk support so `tkinter` can be packaged correctly.
+The packaged build still requires a Windows Python environment with Tcl/Tk available while building so `tkinter` can be bundled correctly.
 
-## Notes
-
-- Default experimental cache root: `%LOCALAPPDATA%\DyingAudio\wwise_cache`
-- The app remembers the last selected install folders in `settings.json`.
-- If an install root is blank, click `Browse` to auto-find a Steam install first, then fall back to manual selection.
-- If you type a bundle name with `.csb`, DyingAudio normalizes it so the output stays `name.csb` and `LoadAudioBanks("name")`
-- Replacing an entry with raw audio automatically switches the build mode to `Raw Audio via DLDT`
-- Raw formats beyond `.wav` and `.ogg` are converted to a temporary WAV automatically during preview/build when FFmpeg is available
-- Preview now prefers direct FFplay/vgmstream streaming for much faster playback startup, with cached temp WAV fallback when needed
-- Retail `DW\\Data` banks using CSB magic `0x00000002` are supported for inspect, edit, and save
-- The DL1 editor uses a normal resizable layout with tabs for Selected Entry and Script Generation, so preview controls stay visible at the default window size
-- The experimental Wwise workspace now builds its named tree directly in Python and extracts mapping XML from `meta*.aesp` automatically
-- Generated mod folders include:
-  - `modinfo.ini`
-  - `data\<bundle>.csb`
-  - `data\scripts\audio\audiodata.scr` when enabled
+### Some code here was generated with AI

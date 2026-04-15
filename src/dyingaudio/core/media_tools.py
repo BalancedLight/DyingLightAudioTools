@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from dyingaudio.settings import application_root
+from dyingaudio.settings import bundled_resource_root
 
 
 COMMON_AUDIO_FILETYPES = [
@@ -49,7 +49,7 @@ def find_tool(executable: str, fallback_paths: list[Path]) -> Path | None:
 
 
 def portable_tools_root() -> Path:
-    return application_root() / "tools"
+    return bundled_resource_root() / "tools"
 
 
 def ensure_portable_tool_layout() -> dict[str, Path]:
@@ -58,6 +58,7 @@ def ensure_portable_tool_layout() -> dict[str, Path]:
         "root": root,
         "wwise": root / "wwise",
         "ffmpeg": root / "ffmpeg",
+        "vgmstream": root / "vgmstream",
     }
     for path in layout.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -153,6 +154,7 @@ def discover_media_tools() -> MediaTools:
     vgmstream_path = find_tool(
         "vgmstream-cli.exe",
         [
+            *_portable_tool_candidates(r"vgmstream\vgmstream-cli.exe", r"vgmstream-cli.exe"),
             local_app_data
             / "Microsoft"
             / "WinGet"
@@ -222,11 +224,18 @@ def _ensure_blank_wwise_project(project_path: Path, tools: MediaTools) -> Path:
     return project_path
 
 
-def _convert_to_wav(source: Path, destination: Path, tools: MediaTools) -> Path:
+def _decode_ffmpeg_to_wav(
+    source: Path,
+    destination: Path,
+    tools: MediaTools,
+    logger: Callable[[str], None],
+    *,
+    missing_message: str,
+    failure_label: str,
+    target_sample_rate: int | None = None,
+) -> Path:
     if tools.ffmpeg_path is None:
-        raise RuntimeError(
-            "FFmpeg is required to prepare non-WAV replacement audio before Wwise conversion."
-        )
+        raise RuntimeError(missing_message)
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         str(tools.ffmpeg_path),
@@ -238,13 +247,54 @@ def _convert_to_wav(source: Path, destination: Path, tools: MediaTools) -> Path:
         "-vn",
         "-acodec",
         "pcm_s16le",
-        str(destination),
     ]
+    if target_sample_rate is not None and target_sample_rate > 0:
+        command.extend(["-ar", str(int(target_sample_rate))])
+    command.append(str(destination))
+    logger(" ".join(command))
     result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.stdout.strip():
+        logger(result.stdout.strip())
+    if result.stderr.strip():
+        logger(result.stderr.strip())
     if result.returncode != 0 or not destination.exists():
         details = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"Could not convert '{source.name}' to WAV.{f' {details}' if details else ''}")
+        raise RuntimeError(f"Could not decode {failure_label} to WAV.{f' {details}' if details else ''}")
     return destination
+
+
+def _decode_vgmstream_to_wav(
+    source: Path,
+    destination: Path,
+    tools: MediaTools,
+    logger: Callable[[str], None],
+    *,
+    label: str,
+) -> Path:
+    if tools.vgmstream_path is None:
+        raise RuntimeError(f"vgmstream is required to decode {label} to WAV.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [str(tools.vgmstream_path), "-o", str(destination), str(source)]
+    logger(" ".join(command))
+    result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.stdout.strip():
+        logger(result.stdout.strip())
+    if result.stderr.strip():
+        logger(result.stderr.strip())
+    if result.returncode != 0 or not destination.exists():
+        raise RuntimeError(f"Could not decode {label} to WAV.")
+    return destination
+
+
+def _convert_to_wav(source: Path, destination: Path, tools: MediaTools) -> Path:
+    return _decode_ffmpeg_to_wav(
+        source,
+        destination,
+        tools,
+        lambda _message: None,
+        missing_message="FFmpeg is required to prepare non-WAV replacement audio before Wwise conversion.",
+        failure_label=f"'{source.name}'",
+    )
 
 
 def _write_wsources(path: Path, source_path: Path, destination_name: str) -> Path:
@@ -262,9 +312,9 @@ def _write_wsources(path: Path, source_path: Path, destination_name: str) -> Pat
     return path
 
 
-def convert_audio_to_wem(
+def decode_audio_to_wav(
     source: str | Path,
-    work_root: str | Path,
+    destination: str | Path,
     *,
     log: Callable[[str], None] | None = None,
     tools: MediaTools | None = None,
@@ -272,7 +322,48 @@ def convert_audio_to_wem(
     resolved_source = Path(source).expanduser().resolve()
     if not resolved_source.exists():
         raise FileNotFoundError(f"Missing audio source: {resolved_source}")
+
+    destination_path = Path(destination).expanduser().resolve()
+    logger = log or (lambda _message: None)
+    tools = tools or discover_media_tools()
+
+    if resolved_source.suffix.lower() == ".wav":
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if resolved_source != destination_path:
+            shutil.copy2(resolved_source, destination_path)
+        return destination_path
+
     if resolved_source.suffix.lower() == ".wem":
+        return _decode_vgmstream_to_wav(
+            resolved_source,
+            destination_path,
+            tools,
+            logger,
+            label=f"'{resolved_source.name}'",
+        )
+
+    return _decode_ffmpeg_to_wav(
+        resolved_source,
+        destination_path,
+        tools,
+        logger,
+        missing_message=f"FFmpeg is required to decode '{resolved_source.suffix or 'unknown'}' files to WAV.",
+        failure_label=f"'{resolved_source.name}'",
+    )
+
+
+def convert_audio_to_wem(
+    source: str | Path,
+    work_root: str | Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    tools: MediaTools | None = None,
+    target_sample_rate: int | None = None,
+) -> Path:
+    resolved_source = Path(source).expanduser().resolve()
+    if not resolved_source.exists():
+        raise FileNotFoundError(f"Missing audio source: {resolved_source}")
+    if resolved_source.suffix.lower() == ".wem" and target_sample_rate is None:
         return resolved_source
 
     tools = tools or discover_media_tools()
@@ -284,9 +375,44 @@ def convert_audio_to_wem(
     with tempfile.TemporaryDirectory(prefix="dyingaudio_wem_", dir=str(conversion_root)) as temp_dir:
         temp_root = Path(temp_dir)
         working_source = resolved_source
-        if resolved_source.suffix.lower() != ".wav":
-            working_source = _convert_to_wav(resolved_source, temp_root / "input.wav", tools)
+        if resolved_source.suffix.lower() == ".wem":
+            working_source = decode_audio_to_wav(resolved_source, temp_root / "input.wav", log=logger, tools=tools)
             logger(f"Prepared WAV source from {resolved_source.name}.")
+            if target_sample_rate is not None and target_sample_rate > 0:
+                working_source = _decode_ffmpeg_to_wav(
+                    working_source,
+                    temp_root / "input_resampled.wav",
+                    tools,
+                    logger,
+                    missing_message="FFmpeg is required to resample replacement audio before WEM conversion.",
+                    failure_label=f"'{resolved_source.name}'",
+                    target_sample_rate=target_sample_rate,
+                )
+                logger(f"Resampled {resolved_source.name} to {target_sample_rate} Hz.")
+        elif resolved_source.suffix.lower() != ".wav":
+            working_source = _decode_ffmpeg_to_wav(
+                resolved_source,
+                temp_root / "input.wav",
+                tools,
+                logger,
+                missing_message="FFmpeg is required to prepare non-WAV replacement audio before Wwise conversion.",
+                failure_label=f"'{resolved_source.name}'",
+                target_sample_rate=target_sample_rate,
+            )
+            logger(f"Prepared WAV source from {resolved_source.name}.")
+            if target_sample_rate is not None and target_sample_rate > 0:
+                logger(f"Resampled {resolved_source.name} to {target_sample_rate} Hz.")
+        elif target_sample_rate is not None and target_sample_rate > 0:
+            working_source = _decode_ffmpeg_to_wav(
+                resolved_source,
+                temp_root / "input_resampled.wav",
+                tools,
+                logger,
+                missing_message="FFmpeg is required to resample WAV replacement audio before WEM conversion.",
+                failure_label=f"'{resolved_source.name}'",
+                target_sample_rate=target_sample_rate,
+            )
+            logger(f"Resampled {resolved_source.name} to {target_sample_rate} Hz.")
 
         output_dir = temp_root / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -344,17 +470,25 @@ def convert_audio_to_wem(
         return final_destination
 
 
-def missing_wem_conversion_requirements(source: str | Path, tools: MediaTools | None = None) -> list[str]:
+def missing_wem_conversion_requirements(
+    source: str | Path,
+    tools: MediaTools | None = None,
+    *,
+    target_sample_rate: int | None = None,
+) -> list[str]:
     resolved_source = Path(source).expanduser().resolve()
     suffix = resolved_source.suffix.lower()
-    if suffix == ".wem":
+    requires_conversion = suffix != ".wem" or (target_sample_rate is not None and target_sample_rate > 0)
+    if not requires_conversion:
         return []
     tools = tools or discover_media_tools()
     missing: list[str] = []
     if tools.wwise_console_path is None:
         missing.append("WwiseConsole.exe")
-    if suffix != ".wav" and tools.ffmpeg_path is None:
+    if (suffix != ".wav" or (target_sample_rate is not None and target_sample_rate > 0)) and tools.ffmpeg_path is None:
         missing.append("ffmpeg.exe")
+    if suffix == ".wem" and target_sample_rate is not None and target_sample_rate > 0 and tools.vgmstream_path is None:
+        missing.append("vgmstream-cli.exe")
     return missing
 
 

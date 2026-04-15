@@ -22,7 +22,7 @@ from dyingaudio.core.mod_writer import build_csb_file, build_mod
 from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
-from dyingaudio.models import AudioEntry
+from dyingaudio.models import AudioEntry, entry_type_from_channel_count, format_entry_type
 from dyingaudio.other_workspace import OtherWorkspaceFrame
 from dyingaudio.popups import (
     ask_string_dialog,
@@ -37,13 +37,25 @@ from dyingaudio.settings import (
     DEFAULT_AUDIO_PROCS,
     DEFAULT_BUNDLE_NAME,
     DEFAULT_MOD_NAME,
+    bundled_resource_root,
     discover_dldt_root,
     discover_mods_root,
-    application_root,
     is_windows_dark_mode,
     load_settings,
     save_settings,
 )
+
+
+DL1_SOURCE_FILETYPES = [
+    ("DL1 source files", f"*.fsb {COMMON_AUDIO_FILETYPES[0][1]}"),
+    COMMON_AUDIO_FILETYPES[0],
+    ("FSB files", "*.fsb"),
+    COMMON_AUDIO_FILETYPES[-1],
+]
+
+
+def _is_fsb_source(path: str | Path) -> bool:
+    return Path(path).suffix.lower() == ".fsb"
 
 
 class DyingAudioApp(tk.Tk):
@@ -67,6 +79,7 @@ class DyingAudioApp(tk.Tk):
         self.edit_session_dir: tempfile.TemporaryDirectory[str] | None = None
         self.preview_player = PreviewPlayer()
         self.task_runner = BackgroundTaskRunner(self)
+        self._dark_theme_colors: dict[str, str] | None = None
 
         self.mod_name_var = tk.StringVar(value=self.settings.mod_name or DEFAULT_MOD_NAME)
         self.bundle_name_var = tk.StringVar(value=self.settings.bundle_name or DEFAULT_BUNDLE_NAME)
@@ -106,6 +119,10 @@ class DyingAudioApp(tk.Tk):
         self.selected_source_var = tk.StringVar(value="")
         self.selected_fsb_var = tk.StringVar(value="")
         self.selected_notes_var = tk.StringVar(value="")
+        self._detail_form_loading = False
+        self._detail_form_dirty = False
+        self._detail_entry_index: int | None = None
+        self._suspend_tree_select = False
         self._preview_after_id: str | None = None
         self._preview_started_at: float | None = None
         self._preview_duration_ms = 0
@@ -115,6 +132,7 @@ class DyingAudioApp(tk.Tk):
         self._preview_playback_kind: str | None = None
 
         self._build_ui()
+        self._configure_dark_combobox_popdowns()
         self._load_proc_names()
         self._update_sort_controls()
         self._refresh_tree()
@@ -132,9 +150,16 @@ class DyingAudioApp(tk.Tk):
         self.entry_search_var.trace_add("write", self._on_entry_filter_changed)
         self.sort_field_var.trace_add("write", self._on_entry_filter_changed)
         self.sort_descending_var.trace_add("write", self._on_entry_filter_changed)
+        for traced_var in (
+            self.selected_name_var,
+            self.selected_type_var,
+            self.selected_sample_count_var,
+            self.selected_duration_var,
+        ):
+            traced_var.trace_add("write", self._on_selected_detail_changed)
 
     def _apply_window_icon(self) -> None:
-        icon_path = application_root() / "assets" / "dyinglight_devtools.ico"
+        icon_path = bundled_resource_root() / "assets" / "dyinglight_devtools.ico"
         if not icon_path.exists():
             return
         try:
@@ -159,6 +184,14 @@ class DyingAudioApp(tk.Tk):
         border_color = "#3f3f46"
         selected_background = "#0a84ff"
         selected_foreground = "#ffffff"
+        self._dark_theme_colors = {
+            "background": background,
+            "panel_background": panel_background,
+            "field_background": field_background,
+            "foreground": foreground,
+            "selected_background": selected_background,
+            "selected_foreground": selected_foreground,
+        }
 
         self.configure(bg=background)
         self.option_add("*Background", background)
@@ -171,7 +204,7 @@ class DyingAudioApp(tk.Tk):
         self.option_add("*Menu.foreground", foreground)
         self.option_add("*Menu.activeBackground", panel_background)
         self.option_add("*Menu.activeForeground", foreground)
-        self.option_add("*TCombobox*Listbox.background", panel_background)
+        self.option_add("*TCombobox*Listbox.background", field_background)
         self.option_add("*TCombobox*Listbox.foreground", foreground)
         self.option_add("*TCombobox*Listbox.selectBackground", selected_background)
         self.option_add("*TCombobox*Listbox.selectForeground", selected_foreground)
@@ -189,6 +222,15 @@ class DyingAudioApp(tk.Tk):
         )
         self.style.configure("TEntry", fieldbackground=field_background, foreground=foreground, background=background)
         self.style.configure("TCombobox", fieldbackground=field_background, foreground=foreground, background=background)
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", field_background), ("disabled", panel_background)],
+            foreground=[("readonly", foreground), ("disabled", "#777777")],
+            background=[("readonly", field_background), ("disabled", panel_background)],
+            selectbackground=[("readonly", selected_background)],
+            selectforeground=[("readonly", selected_foreground)],
+            arrowcolor=[("readonly", foreground), ("disabled", "#777777")],
+        )
         self.style.configure(
             "Treeview",
             background=field_background,
@@ -214,6 +256,42 @@ class DyingAudioApp(tk.Tk):
             foreground=[("selected", foreground)],
         )
         self.style.configure("TProgressbar", troughcolor=panel_background, background=selected_background)
+
+    def _iter_child_widgets(self, widget: tk.Misc) -> list[tk.Misc]:
+        descendants: list[tk.Misc] = []
+        for child in widget.winfo_children():
+            descendants.append(child)
+            descendants.extend(self._iter_child_widgets(child))
+        return descendants
+
+    def _configure_dark_combobox_popdowns(self) -> None:
+        if self._dark_theme_colors is None:
+            return
+        for widget in self._iter_child_widgets(self):
+            if isinstance(widget, ttk.Combobox):
+                self._configure_combobox_popdown(widget)
+
+    def _configure_combobox_popdown(self, combobox: ttk.Combobox) -> None:
+        if self._dark_theme_colors is None:
+            return
+        colors = self._dark_theme_colors
+        try:
+            popdown = self.tk.eval(f"ttk::combobox::PopdownWindow {combobox}")
+            listbox = f"{popdown}.f.l"
+            self.tk.call(
+                listbox,
+                "configure",
+                "-background",
+                colors["field_background"],
+                "-foreground",
+                colors["foreground"],
+                "-selectbackground",
+                colors["selected_background"],
+                "-selectforeground",
+                colors["selected_foreground"],
+            )
+        except tk.TclError:
+            pass
 
     def report_callback_exception(self, exc: type[BaseException], val: BaseException, tb: object) -> None:
         details = "".join(traceback.format_exception(exc, val, tb))
@@ -320,27 +398,23 @@ class DyingAudioApp(tk.Tk):
 
         toolbar = ttk.Frame(entries_frame)
         toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        for index in range(9):
+        for index in range(7):
             toolbar.columnconfigure(index, weight=1)
 
-        self.add_audio_button = ttk.Button(toolbar, text="Add Audio", command=self._add_audio_files)
-        self.add_audio_button.grid(row=0, column=0, sticky="ew", padx=2)
-        self.add_fsb_button = ttk.Button(toolbar, text="Add FSB", command=self._add_fsb_files)
-        self.add_fsb_button.grid(row=0, column=1, sticky="ew", padx=2)
+        self.add_source_button = ttk.Button(toolbar, text="Add Audio / FSB", command=self._add_source_files)
+        self.add_source_button.grid(row=0, column=0, sticky="ew", padx=2)
         self.import_manifest_button = ttk.Button(toolbar, text="Import Manifest", command=self._import_manifest)
-        self.import_manifest_button.grid(row=0, column=2, sticky="ew", padx=2)
-        self.replace_audio_button = ttk.Button(toolbar, text="Replace Audio", command=self._replace_selected_with_audio)
-        self.replace_audio_button.grid(row=0, column=3, sticky="ew", padx=2)
-        self.replace_fsb_button = ttk.Button(toolbar, text="Replace FSB", command=self._replace_selected_with_fsb)
-        self.replace_fsb_button.grid(row=0, column=4, sticky="ew", padx=2)
+        self.import_manifest_button.grid(row=0, column=1, sticky="ew", padx=2)
+        self.replace_source_button = ttk.Button(toolbar, text="Replace Audio / FSB", command=self._replace_selected_with_source)
+        self.replace_source_button.grid(row=0, column=2, sticky="ew", padx=2)
         self.remove_entry_button = ttk.Button(toolbar, text="Remove", command=self._remove_selected)
-        self.remove_entry_button.grid(row=0, column=5, sticky="ew", padx=2)
+        self.remove_entry_button.grid(row=0, column=3, sticky="ew", padx=2)
         self.move_up_button = ttk.Button(toolbar, text="Move Up", command=lambda: self._move_selected(-1))
-        self.move_up_button.grid(row=0, column=6, sticky="ew", padx=2)
+        self.move_up_button.grid(row=0, column=4, sticky="ew", padx=2)
         self.move_down_button = ttk.Button(toolbar, text="Move Down", command=lambda: self._move_selected(1))
-        self.move_down_button.grid(row=0, column=7, sticky="ew", padx=2)
+        self.move_down_button.grid(row=0, column=5, sticky="ew", padx=2)
         self.clear_entries_button = ttk.Button(toolbar, text="Clear", command=self._clear_entries)
-        self.clear_entries_button.grid(row=0, column=8, sticky="ew", padx=2)
+        self.clear_entries_button.grid(row=0, column=6, sticky="ew", padx=2)
 
         filter_bar = ttk.Frame(entries_frame)
         filter_bar.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
@@ -375,7 +449,7 @@ class DyingAudioApp(tk.Tk):
             "name": ("Entry Name", 220),
             "mode": ("Mode", 110),
             "source": ("Source", 420),
-            "type": ("Type", 70),
+            "type": ("Type", 120),
             "duration": ("Duration (ms)", 110),
             "samples": ("Samples @ 48k", 120),
         }
@@ -388,8 +462,7 @@ class DyingAudioApp(tk.Tk):
         self.tree.configure(xscrollcommand=scroll_x.set)
 
         self.entry_context_menu = tk.Menu(self, tearoff=False)
-        self.entry_context_menu.add_command(label="Replace Audio...", command=self._replace_selected_with_audio)
-        self.entry_context_menu.add_command(label="Replace FSB...", command=self._replace_selected_with_fsb)
+        self.entry_context_menu.add_command(label="Replace Audio / FSB...", command=self._replace_selected_with_source)
         self.entry_context_menu.add_separator()
         self.entry_context_menu.add_command(label="Export Audio...", command=self._export_selected_audio)
         self.entry_context_menu.add_command(label="Export FSB...", command=self._export_selected_fsb)
@@ -409,24 +482,29 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(detail_frame, text="Entry Name").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         self.selected_name_entry = ttk.Entry(detail_frame, textvariable=self.selected_name_var)
         self.selected_name_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Type").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(detail_frame, text="Type / Channels").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.selected_type_entry = ttk.Entry(detail_frame, textvariable=self.selected_type_var)
         self.selected_type_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Samples @ 48k").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(
+            detail_frame,
+            text="1 = mono, 2 = stereo. Any other value is treated as a channel count.",
+            wraplength=420,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        ttk.Label(detail_frame, text="Samples @ 48k").grid(row=3, column=0, sticky="w", padx=6, pady=6)
         self.selected_sample_count_entry = ttk.Entry(detail_frame, textvariable=self.selected_sample_count_var)
-        self.selected_sample_count_entry.grid(row=2, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Duration (ms)").grid(row=3, column=0, sticky="w", padx=6, pady=6)
+        self.selected_sample_count_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=6)
+        ttk.Label(detail_frame, text="Duration (ms)").grid(row=4, column=0, sticky="w", padx=6, pady=6)
         self.selected_duration_entry = ttk.Entry(detail_frame, textvariable=self.selected_duration_var)
-        self.selected_duration_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Source").grid(row=4, column=0, sticky="nw", padx=6, pady=6)
-        ttk.Label(detail_frame, textvariable=self.selected_source_var, wraplength=420).grid(row=4, column=1, sticky="w", padx=6, pady=6)
-        ttk.Label(detail_frame, text="FSB").grid(row=5, column=0, sticky="nw", padx=6, pady=6)
-        ttk.Label(detail_frame, textvariable=self.selected_fsb_var, wraplength=420).grid(row=5, column=1, sticky="w", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Notes").grid(row=6, column=0, sticky="nw", padx=6, pady=6)
-        ttk.Label(detail_frame, textvariable=self.selected_notes_var, wraplength=420).grid(row=6, column=1, sticky="w", padx=6, pady=6)
+        self.selected_duration_entry.grid(row=4, column=1, sticky="ew", padx=6, pady=6)
+        ttk.Label(detail_frame, text="Source").grid(row=5, column=0, sticky="nw", padx=6, pady=6)
+        ttk.Label(detail_frame, textvariable=self.selected_source_var, wraplength=420).grid(row=5, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(detail_frame, text="FSB").grid(row=6, column=0, sticky="nw", padx=6, pady=6)
+        ttk.Label(detail_frame, textvariable=self.selected_fsb_var, wraplength=420).grid(row=6, column=1, sticky="w", padx=6, pady=6)
+        ttk.Label(detail_frame, text="Notes").grid(row=7, column=0, sticky="nw", padx=6, pady=6)
+        ttk.Label(detail_frame, textvariable=self.selected_notes_var, wraplength=420).grid(row=7, column=1, sticky="w", padx=6, pady=6)
 
         preview_frame = ttk.LabelFrame(detail_frame, text="Preview")
-        preview_frame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
+        preview_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
         preview_frame.columnconfigure(0, weight=1)
         ttk.Label(preview_frame, textvariable=self.preview_info_var, wraplength=420).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=6, pady=6
@@ -447,8 +525,9 @@ class DyingAudioApp(tk.Tk):
             row=3, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6)
         )
 
-        ttk.Button(detail_frame, text="Apply Entry Changes", command=self._apply_selected_entry).grid(
-            row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8)
+        self.apply_entry_button = ttk.Button(detail_frame, text="Apply Entry Changes", command=self._apply_selected_entry)
+        self.apply_entry_button.grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8)
         )
 
         for widget in (
@@ -457,7 +536,6 @@ class DyingAudioApp(tk.Tk):
             self.selected_sample_count_entry,
             self.selected_duration_entry,
         ):
-            widget.bind("<FocusOut>", self._commit_selected_entry_from_focus)
             widget.bind("<Return>", self._commit_selected_entry_from_focus)
 
         script_frame = ttk.Frame(right_tabs, padding=6)
@@ -509,11 +587,9 @@ class DyingAudioApp(tk.Tk):
         self.clear_cache_button.grid(row=0, column=6, sticky="ew", padx=2)
         ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=7, sticky="e", padx=4, pady=(4, 0))
         self._dl1_busy_widgets = [
-            self.add_audio_button,
-            self.add_fsb_button,
+            self.add_source_button,
             self.import_manifest_button,
-            self.replace_audio_button,
-            self.replace_fsb_button,
+            self.replace_source_button,
             self.remove_entry_button,
             self.move_up_button,
             self.move_down_button,
@@ -543,6 +619,62 @@ class DyingAudioApp(tk.Tk):
     def _on_entry_filter_changed(self, *_args: object) -> None:
         self._update_sort_controls()
         self._refresh_tree()
+
+    def _on_selected_detail_changed(self, *_args: object) -> None:
+        if self._detail_form_loading or self._detail_entry_index is None:
+            return
+        self._detail_form_dirty = True
+        self._update_selected_entry_controls()
+
+    def _populate_selected_entry_details(self, index: int | None) -> None:
+        self._detail_form_loading = True
+        try:
+            self._detail_entry_index = index
+            if index is None:
+                self.selected_name_var.set("")
+                self.selected_type_var.set("2")
+                self.selected_sample_count_var.set("0")
+                self.selected_duration_var.set("0")
+                self.selected_source_var.set("")
+                self.selected_fsb_var.set("")
+                self.selected_notes_var.set("")
+            else:
+                entry = self.entries[index]
+                self.selected_name_var.set(entry.entry_name)
+                self.selected_type_var.set(str(entry.entry_type))
+                self.selected_sample_count_var.set(str(entry.sample_count))
+                self.selected_duration_var.set(str(entry.duration_ms))
+                self.selected_source_var.set(entry.source_path)
+                self.selected_fsb_var.set(entry.fsb_path)
+                self.selected_notes_var.set(entry.notes)
+        finally:
+            self._detail_form_loading = False
+        self._detail_form_dirty = False
+        self._update_selected_entry_controls()
+
+    def _update_selected_entry_controls(self) -> None:
+        has_selection = self._detail_entry_index is not None
+        entry_state = "normal" if has_selection else "disabled"
+        for widget in (
+            self.selected_name_entry,
+            self.selected_type_entry,
+            self.selected_sample_count_entry,
+            self.selected_duration_entry,
+        ):
+            widget.configure(state=entry_state)
+        self.apply_entry_button.configure(state="normal" if has_selection and self._detail_form_dirty else "disabled")
+
+    def _clear_suspended_tree_select(self) -> None:
+        self._suspend_tree_select = False
+
+    def _restore_tree_selection(self, index: int | None) -> None:
+        if index is None or str(index) not in self.tree.get_children():
+            return
+        self._suspend_tree_select = True
+        self.tree.selection_set(str(index))
+        self.tree.focus(str(index))
+        self.tree.see(str(index))
+        self.after_idle(self._clear_suspended_tree_select)
 
     def _update_sort_controls(self) -> None:
         is_manual_order = self.sort_field_var.get().strip() == "Original Order"
@@ -586,7 +718,7 @@ class DyingAudioApp(tk.Tk):
             return None
         if index in self._loading_gif_cache:
             return self._loading_gif_cache[index]
-        gif_path = application_root() / "assets" / "MovingGears.gif"
+        gif_path = bundled_resource_root() / "assets" / "MovingGears.gif"
         if not gif_path.exists():
             self._loading_gif_frame_count = 0
             return None
@@ -963,8 +1095,9 @@ class DyingAudioApp(tk.Tk):
                 "This project includes raw audio. Saving or building it will require a valid DLDT toolchain path.",
             )
 
-    def _commit_selected_entry_from_focus(self, _event: object) -> None:
+    def _commit_selected_entry_from_focus(self, _event: object) -> str:
         self._apply_selected_entry()
+        return "break"
 
     def _select_entry(self, index: int) -> None:
         if index < 0 or index >= len(self.entries):
@@ -1078,7 +1211,7 @@ class DyingAudioApp(tk.Tk):
                     entry.entry_name,
                     entry.source_mode,
                     entry.display_source(),
-                    entry.entry_type,
+                    format_entry_type(entry.entry_type),
                     entry.duration_ms,
                     entry.sample_count,
                 ),
@@ -1103,6 +1236,7 @@ class DyingAudioApp(tk.Tk):
                 if search_text in entry.entry_name.lower()
                 or search_text in entry.display_source().lower()
                 or search_text in entry.notes.lower()
+                or search_text in format_entry_type(entry.entry_type).lower()
             ]
 
         sort_field = self.sort_field_var.get().strip()
@@ -1132,25 +1266,41 @@ class DyingAudioApp(tk.Tk):
         return self.entries[index]
 
     def _on_tree_select(self, _event: object) -> None:
+        if self._suspend_tree_select:
+            self._suspend_tree_select = False
+            return
+
         index = self._selected_index()
-        if index is None:
-            self.selected_name_var.set("")
-            self.selected_type_var.set("2")
-            self.selected_sample_count_var.set("0")
-            self.selected_duration_var.set("0")
-            self.selected_source_var.set("")
-            self.selected_fsb_var.set("")
-            self.selected_notes_var.set("")
+        current_index = self._detail_entry_index
+        if self._detail_form_dirty and current_index != index:
+            current_name = "current entry"
+            if current_index is not None and 0 <= current_index < len(self.entries):
+                current_name = self.entries[current_index].entry_name
+            choice = self._ask_yes_no_cancel_window(
+                "Unsaved entry changes",
+                (
+                    f"Apply changes to '{current_name}' before switching selection?\n\n"
+                    "Yes = apply changes\n"
+                    "No = discard changes\n"
+                    "Cancel = keep the current selection"
+                ),
+                kind="question",
+            )
+            if choice is None:
+                self._restore_tree_selection(current_index)
+                return
+            if choice:
+                if not self._apply_selected_entry(target_index=current_index):
+                    self._restore_tree_selection(current_index)
+                return
+            self._detail_form_dirty = False
+
+        if index == current_index and self._detail_form_dirty:
+            self._update_selected_entry_controls()
             self._update_preview_info()
             return
-        entry = self.entries[index]
-        self.selected_name_var.set(entry.entry_name)
-        self.selected_type_var.set(str(entry.entry_type))
-        self.selected_sample_count_var.set(str(entry.sample_count))
-        self.selected_duration_var.set(str(entry.duration_ms))
-        self.selected_source_var.set(entry.source_path)
-        self.selected_fsb_var.set(entry.fsb_path)
-        self.selected_notes_var.set(entry.notes)
+
+        self._populate_selected_entry_details(index)
         self._update_preview_info()
 
     def _show_tree_context_menu(self, event: object) -> str | None:
@@ -1170,8 +1320,7 @@ class DyingAudioApp(tk.Tk):
             selected_entry.source_mode == "fsb" or self.current_toolchain is not None
         )
 
-        self.entry_context_menu.entryconfigure("Replace Audio...", state="normal" if has_selection else "disabled")
-        self.entry_context_menu.entryconfigure("Replace FSB...", state="normal" if has_selection else "disabled")
+        self.entry_context_menu.entryconfigure("Replace Audio / FSB...", state="normal" if has_selection else "disabled")
         self.entry_context_menu.entryconfigure("Export Audio...", state="normal" if can_export_audio else "disabled")
         self.entry_context_menu.entryconfigure("Export FSB...", state="normal" if can_export_fsb else "disabled")
         self.entry_context_menu.entryconfigure("Duplicate Entry", state="normal" if has_selection else "disabled")
@@ -1183,8 +1332,8 @@ class DyingAudioApp(tk.Tk):
             self.entry_context_menu.grab_release()
         return "break"
 
-    def _apply_selected_entry(self) -> bool:
-        index = self._selected_index()
+    def _apply_selected_entry(self, *, target_index: int | None = None) -> bool:
+        index = self._detail_entry_index if target_index is None else target_index
         if index is None:
             return True
 
@@ -1199,69 +1348,116 @@ class DyingAudioApp(tk.Tk):
             )
             self.status_var.set("Entry update failed.")
             return False
+        if entry_type <= 0:
+            self._show_error_window("Invalid entry values", "Type must be 1, 2, or another positive channel count.")
+            self.status_var.set("Entry update failed.")
+            return False
+        if sample_count < 0 or duration_ms < 0:
+            self._show_error_window("Invalid entry values", "Samples @ 48k and Duration (ms) cannot be negative.")
+            self.status_var.set("Entry update failed.")
+            return False
 
         entry = self.entries[index]
         entry.entry_name = self.selected_name_var.get().strip() or entry.entry_name
         entry.entry_type = entry_type
         entry.sample_count = sample_count
         entry.duration_ms = duration_ms
+        self._detail_form_dirty = False
         self._refresh_tree()
-        self.tree.selection_set(str(index))
-        self.tree.focus(str(index))
         self.status_var.set(f"Updated entry '{entry.entry_name}'.")
         return True
 
-    def _add_audio_files(self) -> None:
-        selections = filedialog.askopenfilenames(
-            title="Select audio files",
-            filetypes=COMMON_AUDIO_FILETYPES,
-        )
-        start_index = len(self.entries)
-        for selection in selections:
-            metadata = probe_audio_metadata(selection)
-            path = Path(selection)
-            self.entries.append(
+    def _build_entry_from_source_file(self, selection: str) -> tuple[AudioEntry, str]:
+        path = Path(selection)
+        if _is_fsb_source(path):
+            return (
                 AudioEntry(
                     entry_name=path.stem,
                     source_path=str(path),
-                    source_mode="raw",
-                    entry_type=2,
-                    sample_count=metadata.sample_count_48k,
-                    duration_ms=metadata.duration_ms,
-                    notes=metadata.notes,
-                )
-            )
-        self._ensure_raw_builder_mode()
-        self._refresh_tree()
-        if selections:
-            self._select_entry(start_index)
-            self.status_var.set(f"Added {len(selections)} raw audio file(s).")
-            self._warn_if_raw_entries_need_toolchain()
-        else:
-            self._update_preview_info()
-
-    def _add_fsb_files(self) -> None:
-        selections = filedialog.askopenfilenames(
-            title="Select FSB files",
-            filetypes=[("FSB files", "*.fsb"), ("All files", "*.*")],
-        )
-        start_index = len(self.entries)
-        for selection in selections:
-            path = Path(selection)
-            self.entries.append(
-                AudioEntry(
-                    entry_name=path.stem,
-                    source_path=str(path),
-                    fsb_path=str(path),
                     source_mode="fsb",
+                    fsb_path=str(path),
                     entry_type=2,
-                    notes="Existing FSB file.",
-                )
+                    notes="Existing FSB file. Update Type if the bank is not stereo.",
+                ),
+                "fsb",
             )
+
+        metadata = probe_audio_metadata(path)
+        return (
+            AudioEntry(
+                entry_name=path.stem,
+                source_path=str(path),
+                source_mode="raw",
+                entry_type=entry_type_from_channel_count(metadata.channel_count),
+                sample_count=metadata.sample_count_48k,
+                duration_ms=metadata.duration_ms,
+                notes=metadata.notes,
+            ),
+            "raw",
+        )
+
+    def _apply_source_file_to_entry(self, entry: AudioEntry, selection: str) -> str:
+        path = Path(selection)
+        if _is_fsb_source(path):
+            entry.source_path = str(path)
+            entry.source_mode = "fsb"
+            entry.fsb_path = str(path)
+            entry.notes = f"Replacement FSB: {path.name}"
+            return "fsb"
+
+        metadata = probe_audio_metadata(path)
+        entry.source_path = str(path)
+        entry.source_mode = "raw"
+        entry.fsb_path = ""
+        entry.entry_type = entry_type_from_channel_count(metadata.channel_count)
+        entry.sample_count = metadata.sample_count_48k
+        entry.duration_ms = metadata.duration_ms
+        entry.notes = f"Replacement audio: {metadata.notes or path.name}"
+        return "raw"
+
+    def _format_source_summary(self, raw_count: int, fsb_count: int) -> str:
+        parts: list[str] = []
+        if raw_count:
+            parts.append(f"{raw_count} audio")
+        if fsb_count:
+            parts.append(f"{fsb_count} FSB")
+        return ", ".join(parts) if parts else "0 files"
+
+    def _add_source_files(self) -> None:
+        selections = filedialog.askopenfilenames(
+            title="Select audio or FSB files",
+            filetypes=DL1_SOURCE_FILETYPES,
+        )
+        if not selections:
+            self._update_preview_info()
+            return
+
+        raw_count = 0
+        fsb_count = 0
+        new_entries: list[AudioEntry] = []
+        try:
+            for selection in selections:
+                entry, source_kind = self._build_entry_from_source_file(selection)
+                new_entries.append(entry)
+                if source_kind == "raw":
+                    raw_count += 1
+                else:
+                    fsb_count += 1
+        except Exception as exc:
+            self._show_error_window("Add audio / FSB failed", str(exc))
+            self.status_var.set("Add failed.")
+            self._append_log(f"ERROR: {exc}")
+            return
+
+        start_index = len(self.entries)
+        self.entries.extend(new_entries)
+        if raw_count:
+            self._ensure_raw_builder_mode()
         self._refresh_tree()
-        if selections:
-            self._select_entry(start_index)
-            self.status_var.set(f"Added {len(selections)} FSB file(s).")
+        self._select_entry(start_index)
+        self.status_var.set(f"Added {self._format_source_summary(raw_count, fsb_count)}.")
+        if raw_count:
+            self._warn_if_raw_entries_need_toolchain()
         else:
             self._update_preview_info()
 
@@ -1328,26 +1524,23 @@ class DyingAudioApp(tk.Tk):
             on_success=on_success,
         )
 
-    def _replace_selected_with_audio(self) -> None:
+    def _replace_selected_with_source(self) -> None:
         if not self._apply_selected_entry():
             return
 
         index = self._selected_index()
         if index is None:
-            self._show_info_window("Replace audio", "Select an entry to replace first.")
+            self._show_info_window("Replace audio / FSB", "Select an entry to replace first.")
             return
 
-        selection = filedialog.askopenfilename(
-            title="Replace selected entry with audio",
-            filetypes=COMMON_AUDIO_FILETYPES,
-        )
+        selection = filedialog.askopenfilename(title="Replace selected entry with audio or FSB", filetypes=DL1_SOURCE_FILETYPES)
         if not selection:
             return
 
         try:
-            metadata = probe_audio_metadata(selection)
+            source_kind = self._apply_source_file_to_entry(self.entries[index], selection)
         except Exception as exc:
-            self._show_error_window("Replace audio failed", str(exc))
+            self._show_error_window("Replace audio / FSB failed", str(exc))
             self.status_var.set("Replace failed.")
             self._append_log(f"ERROR: {exc}")
             return
@@ -1355,44 +1548,12 @@ class DyingAudioApp(tk.Tk):
         entry = self.entries[index]
         self.preview_player.stop()
         self._reset_preview_progress()
-        entry.source_path = selection
-        entry.source_mode = "raw"
-        entry.fsb_path = ""
-        entry.sample_count = metadata.sample_count_48k
-        entry.duration_ms = metadata.duration_ms
-        entry.notes = f"Replacement audio: {metadata.notes or Path(selection).name}"
-        self._ensure_raw_builder_mode()
-        self._warn_if_raw_entries_need_toolchain()
+        if source_kind == "raw":
+            self._ensure_raw_builder_mode()
+            self._warn_if_raw_entries_need_toolchain()
         self._refresh_tree()
         self._select_entry(index)
-        self.status_var.set(f"Replaced '{entry.entry_name}' with new audio.")
-
-    def _replace_selected_with_fsb(self) -> None:
-        if not self._apply_selected_entry():
-            return
-
-        index = self._selected_index()
-        if index is None:
-            self._show_info_window("Replace FSB", "Select an entry to replace first.")
-            return
-
-        selection = filedialog.askopenfilename(
-            title="Replace selected entry with FSB",
-            filetypes=[("FSB files", "*.fsb"), ("All files", "*.*")],
-        )
-        if not selection:
-            return
-
-        entry = self.entries[index]
-        self.preview_player.stop()
-        self._reset_preview_progress()
-        entry.source_path = selection
-        entry.source_mode = "fsb"
-        entry.fsb_path = selection
-        entry.notes = f"Replacement FSB: {Path(selection).name}"
-        self._refresh_tree()
-        self._select_entry(index)
-        self.status_var.set(f"Replaced '{entry.entry_name}' with new FSB.")
+        self.status_var.set(f"Replaced '{entry.entry_name}' with new {'audio' if source_kind == 'raw' else 'FSB'}.")
 
     def _suggest_export_audio_name(self, entry: AudioEntry) -> str:
         if entry.source_mode == "raw":
@@ -1717,7 +1878,7 @@ class DyingAudioApp(tk.Tk):
             tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
             columns = {
                 "name": ("Entry Name", 280),
-                "type": ("Type", 80),
+                "type": ("Type", 120),
                 "duration": ("Duration (ms)", 120),
                 "samples": ("Samples @ 48k", 140),
                 "notes": ("Notes", 360),
@@ -1730,7 +1891,7 @@ class DyingAudioApp(tk.Tk):
                 tree.insert(
                     "",
                     "end",
-                    values=(entry.entry_name, entry.entry_type, entry.duration_ms, entry.sample_count, entry.notes),
+                    values=(entry.entry_name, format_entry_type(entry.entry_type), entry.duration_ms, entry.sample_count, entry.notes),
                 )
             self.task_status_var.set("Inspect complete.")
             self.status_var.set(f"Inspected {Path(selection).name}.")

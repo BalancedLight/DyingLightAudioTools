@@ -4,14 +4,80 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 
+function Test-IsWindowsAppsAlias {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $CommandPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandPath)) {
+        return $false
+    }
+
+    $windowsAppsRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    $fullPath = [System.IO.Path]::GetFullPath($CommandPath)
+    return $fullPath.StartsWith($windowsAppsRoot, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-CommandPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        $CommandInfo
+    )
+
+    if ($null -ne $CommandInfo.Source -and -not [string]::IsNullOrWhiteSpace($CommandInfo.Source)) {
+        return $CommandInfo.Source
+    }
+
+    return $CommandInfo.Path
+}
+
 function Test-TkBuildReady {
     param(
         [Parameter(Mandatory = $true)]
-        [string] $PythonExe
+        [string] $PythonExe,
+
+        [int] $TimeoutSeconds = 15
     )
 
-    & $PythonExe -c "import tkinter; from PyInstaller.utils.hooks.tcl_tk import tcltk_info; raise SystemExit(0 if tcltk_info.available else 1)" 2>$null
-    return $LASTEXITCODE -eq 0
+    if ([string]::IsNullOrWhiteSpace($PythonExe) -or -not (Test-Path $PythonExe) -or (Test-IsWindowsAppsAlias -CommandPath $PythonExe)) {
+        return $false
+    }
+
+    $probeScript = 'import tkinter; from PyInstaller.utils.hooks.tcl_tk import tcltk_info; raise SystemExit(0 if tcltk_info.available else 1)'
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $PythonExe
+    $startInfo.Arguments = '-c "' + $probeScript + '"'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+
+    try {
+        [void] $process.Start()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+            }
+            Write-Warning "Timed out while probing Python interpreter: $PythonExe"
+            return $false
+        }
+
+        [void] $process.StandardOutput.ReadToEnd()
+        [void] $process.StandardError.ReadToEnd()
+        return $process.ExitCode -eq 0
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 function Get-TkEnvironment {
@@ -22,9 +88,27 @@ function Get-TkEnvironment {
         $roots += $localPythonRoot
     }
 
-    $pythonExeRoot = Split-Path -Parent (Get-Command python -ErrorAction SilentlyContinue | ForEach-Object { $_.Source } | Select-Object -First 1)
+    $pythonCmd = Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object {
+            $commandPath = Get-CommandPath -CommandInfo $_
+            -not (Test-IsWindowsAppsAlias -CommandPath $commandPath)
+        } |
+        Select-Object -First 1
+    $pythonExePath = if ($null -ne $pythonCmd) { Get-CommandPath -CommandInfo $pythonCmd } else { $null }
+    $pythonExeRoot = Split-Path -Parent $pythonExePath
     if ($pythonExeRoot) {
         $roots += $pythonExeRoot
+        if ((Split-Path -Leaf $pythonExeRoot) -ieq "bin") {
+            $roots += Split-Path -Parent $pythonExeRoot
+        }
+    }
+
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($null -ne $pyLauncher) {
+        $resolvedExe = (& (Get-CommandPath -CommandInfo $pyLauncher) -3 -c "import sys; print(sys.executable)" 2>$null).Trim()
+        if ($resolvedExe -and (Test-Path $resolvedExe)) {
+            $roots += Split-Path -Parent $resolvedExe
+        }
     }
 
     $roots += "C:\Python314"
@@ -61,16 +145,30 @@ function Get-PreferredPythonExe {
         return $localPython
     }
 
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($null -ne $pythonCmd -and (Test-TkBuildReady -PythonExe $pythonCmd.Source)) {
-        return $pythonCmd.Source
+    $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
+    if ((Test-Path $venvPython) -and (Test-TkBuildReady -PythonExe $venvPython)) {
+        return $venvPython
+    }
+
+    $pythonCmd = Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object {
+            $commandPath = Get-CommandPath -CommandInfo $_
+            -not (Test-IsWindowsAppsAlias -CommandPath $commandPath)
+        } |
+        Select-Object -First 1
+    if ($null -ne $pythonCmd) {
+        $pythonCmdPath = Get-CommandPath -CommandInfo $pythonCmd
+        if (Test-TkBuildReady -PythonExe $pythonCmdPath) {
+            return $pythonCmdPath
+        }
     }
 
     $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
     if ($null -ne $pyLauncher) {
-        & $pyLauncher.Source -3 -c "import sys; print(sys.executable)" 2>$null
+        $pyLauncherPath = Get-CommandPath -CommandInfo $pyLauncher
+        & $pyLauncherPath -3 -c "import sys; print(sys.executable)" 2>$null
         if ($LASTEXITCODE -eq 0) {
-            $resolvedExe = (& $pyLauncher.Source -3 -c "import sys; print(sys.executable)" 2>$null).Trim()
+            $resolvedExe = (& $pyLauncherPath -3 -c "import sys; print(sys.executable)" 2>$null).Trim()
             if ($resolvedExe -and (Test-Path $resolvedExe) -and (Test-TkBuildReady -PythonExe $resolvedExe)) {
                 return $resolvedExe
             }
@@ -82,11 +180,16 @@ function Get-PreferredPythonExe {
 
 $pythonExe = Get-PreferredPythonExe
 if ([string]::IsNullOrWhiteSpace($pythonExe)) {
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    $pythonCmd = Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object {
+            $commandPath = Get-CommandPath -CommandInfo $_
+            -not (Test-IsWindowsAppsAlias -CommandPath $commandPath)
+        } |
+        Select-Object -First 1
     if ($null -eq $pythonCmd) {
-        throw "Could not find Python. Install Python 3.11+ with tkinter/Tcl/Tk support."
+        throw "Could not find a real Python interpreter. Install Python 3.11+ with tkinter/Tcl/Tk support and disable the Windows Apps python alias if it is shadowing your install."
     }
-    $pythonExe = $pythonCmd.Source
+    $pythonExe = Get-CommandPath -CommandInfo $pythonCmd
 }
 
 $tkEnv = Get-TkEnvironment
