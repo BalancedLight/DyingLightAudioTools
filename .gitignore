@@ -49,3 +49,4 @@ _dw_menu_dump.fsb
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md
 AGENT.md
+.codacy/

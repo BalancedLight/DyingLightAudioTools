@@ -10,13 +10,27 @@ from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
+from dyingaudio.audio_info import AudioMetadata, probe_audio_metadata
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
+from dyingaudio.core.aesp_writer import (
+    AespReplacementResult,
+    replace_aesp_external_media,
+    restore_aesp_from_backup,
+)
+from dyingaudio.core.media_tools import (
+    COMMON_AUDIO_FILETYPES,
+    convert_audio_to_wem,
+    discover_media_tools,
+    ensure_portable_tool_layout,
+    missing_wem_conversion_requirements,
+)
 from dyingaudio.core.preview import PreviewPlayer
 from dyingaudio.core.wwise_audio_type import audio_type_label
 from dyingaudio.core.wwise_workspace import (
     BASE_ARCHIVE_SET,
     DL2_GAME,
     DLTB_GAME,
+    ArchiveBundle,
     ArchiveSetDescriptor,
     NamedAudioLink,
     WwiseWorkspace,
@@ -28,6 +42,7 @@ from dyingaudio.core.wwise_workspace import (
     export_workspace_dump,
     game_label,
     media_signature_for_path,
+    resolve_archive_bundle,
     workspace_details_text,
 )
 from dyingaudio.models import AudioEntry
@@ -189,6 +204,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.app = app if app is not None else self.winfo_toplevel()
         self.preview_player = PreviewPlayer()
         self.workspace: WwiseWorkspace | None = None
+        self.archive_bundle: ArchiveBundle | None = None
         self.available_archive_sets: list[ArchiveSetDescriptor] = []
         self.tree_node_context: dict[str, tuple[str, str, str, str]] = {}
         self.visible_rows: list[NamedAudioLink] = []
@@ -213,6 +229,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.media_sort_button_var = tk.StringVar(value="Ascending")
         self.media_count_var = tk.StringVar(value="0 shown / 0 total")
         self.group_similar_var = tk.BooleanVar(value=False)
+        self.enable_replace_audio_var = tk.BooleanVar(value=False)
+        self.hide_replacement_warnings_var = tk.BooleanVar(value=settings.hide_replacement_warnings)
         self.task_status_var = tk.StringVar(value="No experimental task running.")
         self.task_progress_var = tk.DoubleVar(value=0.0)
         self.task_runner = BackgroundTaskRunner(self)
@@ -256,6 +274,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             archive_set=self.archive_set_var.get().strip() or BASE_ARCHIVE_SET,
             cache_root=self.cache_root_var.get().strip() or DEFAULT_EXPERIMENTAL_CACHE_ROOT,
             last_export_folder=self._last_export_folder(),
+            hide_replacement_warnings=self.hide_replacement_warnings_var.get(),
         )
 
     def shutdown(self) -> None:
@@ -374,6 +393,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             media_tree_frame,
             columns=("media_id", "archive", "bank", "event", "audio_type", "duration", "samples", "source"),
             show="tree headings",
+            selectmode="extended",
             height=18,
         )
         self.media_tree.grid(row=0, column=0, sticky="nsew")
@@ -403,10 +423,13 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.media_context_menu = tk.Menu(self, tearoff=False)
         self.media_context_menu.add_command(label="Export Selected Media...", command=self._export_selected_media)
         self.media_context_menu.add_command(label="Export Mixed Audio...", command=self._export_selected_media_mixed)
+        self.media_context_menu.add_separator()
+        self.media_context_menu.add_command(label="Replace Selected Audio...", command=self._replace_selected_media_aesp)
+        self.media_context_menu.add_command(label="Restore Original AESP...", command=self._restore_aesp_archive)
 
         center_actions = ttk.Frame(center)
         center_actions.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
-        for column in range(3):
+        for column in range(4):
             center_actions.columnconfigure(column, weight=1)
         self.export_media_button = ttk.Button(center_actions, text="Export Selected Media", command=self._export_selected_media)
         self.export_media_button.grid(row=0, column=0, sticky="ew", padx=2)
@@ -414,6 +437,24 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.export_event_button.grid(row=0, column=1, sticky="ew", padx=2)
         self.export_bank_button = ttk.Button(center_actions, text="Export Selected Bank Files", command=self._export_selected_bank_files)
         self.export_bank_button.grid(row=0, column=2, sticky="ew", padx=2)
+        self.replace_audio_button = ttk.Button(center_actions, text="Replace Selected Audio", command=self._replace_selected_media_aesp)
+        self.replace_audio_button.grid(row=0, column=3, sticky="ew", padx=2)
+
+        replace_toggle_frame = ttk.Frame(center)
+        replace_toggle_frame.grid(row=3, column=0, sticky="w", padx=6, pady=(0, 4))
+        self.enable_replace_audio_checkbutton = ttk.Checkbutton(
+            replace_toggle_frame,
+            text="Enable experimental AESP replacement (modifies game files)",
+            variable=self.enable_replace_audio_var,
+        )
+        self.enable_replace_audio_checkbutton.grid(row=0, column=0, sticky="w")
+        self.hide_warnings_checkbutton = ttk.Checkbutton(
+            replace_toggle_frame,
+            text="Hide replacement warnings",
+            variable=self.hide_replacement_warnings_var,
+            command=self._on_hide_warnings_toggled,
+        )
+        self.hide_warnings_checkbutton.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         preview_tab = ttk.Frame(right, padding=6)
         preview_tab.columnconfigure(0, weight=1)
@@ -453,6 +494,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self.export_media_button,
             self.export_event_button,
             self.export_bank_button,
+            self.replace_audio_button,
             self.export_dump_button,
         ]
         self._pane_layout_after_ids.append(self.after_idle(self._ensure_default_pane_layout))
@@ -764,6 +806,22 @@ class ExperimentalWwiseFrame(ttk.Frame):
         if callable(save_settings):
             save_settings()
 
+    def _on_hide_warnings_toggled(self) -> None:
+        if self.hide_replacement_warnings_var.get():
+            confirmed = self._ask_yes_no_window(
+                "Hide replacement warnings",
+                (
+                    "This will skip sample-rate, duration, and confirmation dialogs during replacement.\n\n"
+                    "Replacements will proceed immediately after you pick a file.\n\n"
+                    "Are you sure you want to hide these warnings?"
+                ),
+                kind="warning",
+            )
+            if not confirmed:
+                self.hide_replacement_warnings_var.set(False)
+                return
+        self._persist_settings()
+
     def _popup_context_menu(self, menu: tk.Menu, widget: tk.Misc, event: object) -> None:
         x_root = getattr(event, "x_root", None)
         y_root = getattr(event, "y_root", None)
@@ -796,13 +854,19 @@ class ExperimentalWwiseFrame(ttk.Frame):
         y = getattr(event, "y", None)
         node_id = self.media_tree.identify_row(y) if y is not None else ""
         if node_id:
-            self.media_tree.selection_set(node_id)
-            self.media_tree.focus(node_id)
-            self._on_media_select(event)
+            current_selection = set(self.media_tree.selection())
+            if node_id not in current_selection:
+                self.media_tree.selection_set(node_id)
+                self.media_tree.focus(node_id)
+                self._on_media_select(event)
 
         group_rows = self._selected_group_preview_rows()
         mixed_export_ready = len(group_rows) >= 2 and self.preview_player.environment.ffmpeg_path is not None
         self.media_context_menu.entryconfigure("Export Mixed Audio...", state="normal" if mixed_export_ready else "disabled")
+        replaceable = len(self._selected_replaceable_rows()) > 0 and self.enable_replace_audio_var.get()
+        self.media_context_menu.entryconfigure("Replace Selected Audio...", state="normal" if replaceable else "disabled")
+        has_backup = self._has_aesp_backup_for_selection()
+        self.media_context_menu.entryconfigure("Restore Original AESP...", state="normal" if has_backup else "disabled")
         self._popup_context_menu(self.media_context_menu, self.media_tree, event)
         return "break"
 
@@ -907,6 +971,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             cleared_target = result if isinstance(result, Path) else target
             self.preview_player.clear_cache()
             self.workspace = None
+            self.archive_bundle = None
             self.tree_node_context.clear()
             self.visible_rows = []
             self.browser_tree.delete(*self.browser_tree.get_children())
@@ -978,6 +1043,10 @@ class ExperimentalWwiseFrame(ttk.Frame):
             if workspace is None:
                 raise RuntimeError("Experimental workspace build returned an unexpected result.")
             self.workspace = workspace
+            try:
+                self.archive_bundle = resolve_archive_bundle(game, install_root, archive_set)
+            except Exception:
+                self.archive_bundle = None
             self.workspace_var.set(f"Workspace: {workspace.root}")
             self._populate_browser_tree()
             self._refresh_logs()
@@ -1602,4 +1671,328 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 cancel_event=self.task_runner.cancel_event,
             ),
             on_success=lambda result: self._append_status(f"Exported workspace dump to {result}."),
+        )
+
+    # ------------------------------------------------------------------
+    # AESP replacement
+    # ------------------------------------------------------------------
+
+    def _resolve_archive_path(self, archive: str) -> Path | None:
+        """Return the absolute path to the AESP file for *archive* (sfx/streams)."""
+        bundle = self.archive_bundle
+        if bundle is None:
+            return None
+        mapping = {"sfx": bundle.sfx_path, "streams": bundle.streams_path, "meta": bundle.meta_path}
+        return mapping.get(archive)
+
+    def _selected_replaceable_row(self) -> NamedAudioLink | None:
+        """Return a single non-group ``NamedAudioLink`` if exactly one is selected."""
+        rows = self._selected_replaceable_rows()
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
+    def _selected_replaceable_rows(self) -> list[NamedAudioLink]:
+        """Return all non-group ``NamedAudioLink`` rows in the current selection."""
+        result: list[NamedAudioLink] = []
+        seen: set[int] = set()
+        for iid in self.media_tree.selection():
+            if iid in self.media_group_iids:
+                continue
+            for row in self.media_iid_rows.get(iid, []):
+                if row.media_id in seen:
+                    continue
+                seen.add(row.media_id)
+                result.append(row)
+        return result
+
+    def _has_aesp_backup_for_selection(self) -> bool:
+        """Check if a ``.bak`` exists for any selected row's archive."""
+        rows = self._selected_replaceable_rows()
+        if not rows:
+            return False
+        for row in rows:
+            archive_path = self._resolve_archive_path(row.archive)
+            if archive_path is not None and Path(f"{archive_path}.bak").exists():
+                return True
+        return False
+
+    def _replace_selected_media_aesp(self) -> None:
+        if not self.enable_replace_audio_var.get():
+            self._show_info_window(
+                "Replace selected audio",
+                "Enable the experimental AESP replacement toggle first.",
+            )
+            return
+        if self.workspace is None or self.archive_bundle is None:
+            self._show_info_window("Replace selected audio", "Build the experimental workspace first.")
+            return
+        rows = self._selected_replaceable_rows()
+        if not rows:
+            self._show_info_window(
+                "Replace selected audio",
+                "Select one or more media rows to replace. Group rows cannot be replaced directly.",
+            )
+            return
+        unsupported = [r for r in rows if r.archive not in {"sfx", "streams", "meta"}]
+        if unsupported:
+            names = ", ".join(sorted({r.archive for r in unsupported}))
+            self._show_info_window(
+                "Replace selected audio",
+                f"The following archive types do not support replacement: {names}.",
+            )
+            return
+
+        for row in rows:
+            archive_path = self._resolve_archive_path(row.archive)
+            if archive_path is None or not archive_path.exists():
+                self._show_error_window("Replace selected audio", f"Could not locate the {row.archive}.aesp archive file.")
+                return
+
+        if len(rows) == 1:
+            title = f"Replace media {rows[0].media_id} ({rows[0].event})"
+        else:
+            title = f"Replace {len(rows)} selected media entries"
+
+        selection = filedialog.askopenfilename(
+            title=title,
+            filetypes=[("Wwise media", "*.wem"), *COMMON_AUDIO_FILETYPES, ("All files", "*.*")],
+        )
+        if not selection:
+            return
+        replacement_path = Path(selection).resolve()
+
+        try:
+            replacement_metadata = probe_audio_metadata(replacement_path)
+        except Exception as exc:
+            self._show_error_window("Replace selected audio failed", f"Could not inspect the selected audio. {exc}")
+            return
+
+        hide_warnings = self.hide_replacement_warnings_var.get()
+
+        # For single replacement, probe the current audio and show warnings
+        target_sample_rate: int | None = None
+        if len(rows) == 1 and not hide_warnings:
+            row = rows[0]
+            current_metadata: AudioMetadata | None = None
+            try:
+                current_metadata = probe_audio_metadata(row.source)
+            except Exception:
+                current_metadata = None
+
+            # Sample rate check
+            if (
+                current_metadata is not None
+                and current_metadata.detected_sample_rate > 0
+                and replacement_metadata.detected_sample_rate > 0
+                and current_metadata.detected_sample_rate != replacement_metadata.detected_sample_rate
+            ):
+                should_resample = self._ask_yes_no_window(
+                    "Sample rate mismatch",
+                    (
+                        f"Current audio sample rate: {current_metadata.detected_sample_rate} Hz\n"
+                        f"Replacement sample rate: {replacement_metadata.detected_sample_rate} Hz\n\n"
+                        "Resample the replacement to match the current audio?"
+                    ),
+                    kind="warning",
+                )
+                if should_resample:
+                    target_sample_rate = current_metadata.detected_sample_rate
+
+            # Duration check
+            if (
+                current_metadata is not None
+                and current_metadata.duration_ms > 0
+                and replacement_metadata.duration_ms > 0
+            ):
+                duration_delta = abs(replacement_metadata.duration_ms - current_metadata.duration_ms)
+                if duration_delta > 5:
+                    should_continue = self._ask_yes_no_window(
+                        "Audio length mismatch",
+                        (
+                            "The selected replacement audio does not match the current file length.\n\n"
+                            f"Current audio: {current_metadata.duration_ms} ms\n"
+                            f"Replacement: {replacement_metadata.duration_ms} ms\n\n"
+                            "This can cause looping or timing issues in game.\n\n"
+                            "Continue anyway?"
+                        ),
+                        kind="warning",
+                    )
+                    if not should_continue:
+                        self._append_status("Replacement cancelled due to audio length mismatch.")
+                        return
+
+        # Check tools (always — this is not a skippable warning)
+        tools = discover_media_tools()
+        missing_tools = missing_wem_conversion_requirements(
+            replacement_path,
+            tools,
+            target_sample_rate=target_sample_rate,
+        )
+        if missing_tools:
+            layout = ensure_portable_tool_layout()
+            details = [
+                "This replacement needs extra portable tools before it can be converted to .wem.",
+                "",
+                f"Selected file: {replacement_path.name}",
+                f"Missing tools: {', '.join(missing_tools)}",
+                "",
+                f"Portable tools folder: {layout['root']}",
+                f"Wwise drop folder: {layout['wwise']}",
+                f"FFmpeg drop folder: {layout['ffmpeg']}",
+                f"vgmstream drop folder: {layout['vgmstream']}",
+                "",
+                "Open the portable tools folder now?",
+            ]
+            should_open = self._ask_yes_no_window(
+                "Missing conversion tools",
+                "\n".join(details),
+                kind="warning",
+            )
+            if should_open:
+                os.startfile(str(layout["root"]))
+            self._append_status("Replacement cancelled until portable conversion tools are available.")
+            return
+
+        # Final confirmation
+        if not hide_warnings:
+            if len(rows) == 1:
+                row = rows[0]
+                archive_path = self._resolve_archive_path(row.archive)
+                confirm_message = (
+                    f"This will modify the game archive:\n{archive_path.name}\n\n"
+                    f"Media ID: {row.media_id}\n"
+                    f"Archive: {row.archive}\n"
+                    f"Bank: {row.bank}\n"
+                    f"Event: {row.event}\n\n"
+                    "A .bak backup will be created on the first modification.\n\n"
+                    "Continue?"
+                )
+            else:
+                archive_names = sorted({r.archive for r in rows})
+                confirm_message = (
+                    f"This will replace {len(rows)} media entries across archive(s): {', '.join(archive_names)}\n\n"
+                    "All selected entries will receive the same replacement audio.\n\n"
+                    "A .bak backup will be created on the first modification to each archive.\n\n"
+                    "Continue?"
+                )
+            should_continue = self._ask_yes_no_window("Confirm AESP replacement", confirm_message, kind="warning")
+            if not should_continue:
+                self._append_status("AESP replacement cancelled.")
+                return
+
+        replacement_rows = list(rows)
+        conversion_root = self.workspace.root / "replacement_conversion"
+        meta_archive_path = self._resolve_archive_path("meta")
+
+        def worker(progress, log):
+            normalized_path = replacement_path
+            if replacement_path.suffix.lower() != ".wem" or target_sample_rate is not None:
+                if progress is not None:
+                    progress(f"Converting {replacement_path.name} to WEM...", 0, 1 + len(replacement_rows))
+                normalized_path = convert_audio_to_wem(
+                    replacement_path,
+                    conversion_root,
+                    log=log,
+                    target_sample_rate=target_sample_rate,
+                )
+            results: list[AespReplacementResult] = []
+            for idx, target_row in enumerate(replacement_rows):
+                if progress is not None:
+                    progress(
+                        f"Replacing media {target_row.media_id} ({idx + 1}/{len(replacement_rows)})...",
+                        idx + 1,
+                        len(replacement_rows) + 1,
+                    )
+                target_archive_path = self._resolve_archive_path(target_row.archive)
+                result = replace_aesp_external_media(
+                    target_archive_path,
+                    target_row.media_id,
+                    normalized_path,
+                    log,
+                    meta_path=meta_archive_path,
+                    progress=progress,
+                    cancel_event=self.task_runner.cancel_event,
+                )
+                results.append(result)
+            return results
+
+        def on_success(result: object) -> None:
+            if not isinstance(result, list):
+                return
+            for item in result:
+                if isinstance(item, AespReplacementResult):
+                    self._append_status(
+                        f"Replaced media {item.media_id} in {item.archive_path.name}. Backup: {item.backup_path.name}"
+                    )
+            if len(result) > 1:
+                self._append_status(f"Batch replacement complete: {len(result)} entries replaced.")
+
+        if len(replacement_rows) == 1:
+            start_msg = f"Replacing media {replacement_rows[0].media_id} in {replacement_rows[0].archive}.aesp..."
+        else:
+            start_msg = f"Replacing {len(replacement_rows)} media entries..."
+
+        self._run_task(
+            start_message=start_msg,
+            error_title="Replace selected audio failed",
+            worker=worker,
+            on_success=on_success,
+        )
+
+    def _restore_aesp_archive(self) -> None:
+        rows = self._selected_replaceable_rows()
+        if not rows:
+            self._show_info_window("Restore original AESP", "Select a media row first.")
+            return
+        # Collect unique archives that have backups
+        archives_to_restore: dict[str, Path] = {}
+        for row in rows:
+            if row.archive in archives_to_restore:
+                continue
+            archive_path = self._resolve_archive_path(row.archive)
+            if archive_path is not None and Path(f"{archive_path}.bak").exists():
+                archives_to_restore[row.archive] = archive_path
+        if not archives_to_restore:
+            self._show_info_window("Restore original AESP", "No backups found for the selected archives.")
+            return
+
+        archive_names = ", ".join(p.name for p in archives_to_restore.values())
+        should_continue = self._ask_yes_no_window(
+            "Restore original AESP",
+            (
+                f"Restore the following archive(s) from backup?\n{archive_names}\n\n"
+                "This will undo ALL replacements made to these archives."
+            ),
+            kind="warning",
+        )
+        if not should_continue:
+            return
+
+        restore_paths = list(archives_to_restore.values())
+
+        def worker(progress, log):
+            for idx, archive_path in enumerate(restore_paths):
+                if progress is not None:
+                    progress(f"Restoring {archive_path.name} from backup...", idx, len(restore_paths))
+                result = restore_aesp_from_backup(archive_path)
+                log(f"Restored {archive_path.name} from {result.name}.")
+            # Also restore meta.aesp if a backup exists (we patch BNK sizes there)
+            meta_archive_path = self._resolve_archive_path("meta")
+            if meta_archive_path is not None and meta_archive_path not in restore_paths:
+                meta_backup = Path(f"{meta_archive_path}.bak")
+                if meta_backup.exists():
+                    restore_aesp_from_backup(meta_archive_path)
+                    log(f"Restored {meta_archive_path.name} from {meta_backup.name}.")
+            return restore_paths
+
+        def on_success(result: object) -> None:
+            names = ", ".join(p.name for p in (result if isinstance(result, list) else []))
+            self._append_status(f"Restored: {names}")
+
+        self._run_task(
+            start_message=f"Restoring {archive_names}...",
+            error_title="Restore AESP failed",
+            worker=worker,
+            on_success=on_success,
         )

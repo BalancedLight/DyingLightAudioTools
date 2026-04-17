@@ -179,7 +179,18 @@ def _ensure_blank_wwise_project(project_path: Path, tools: MediaTools) -> Path:
             "WwiseConsole was not found. Install Audiokinetic Wwise Authoring to convert non-WEM audio into .wem files."
         )
     if project_path.exists():
-        return project_path
+        # Verify the project matches the current WwiseConsole install.
+        # If the user switches Wwise versions the stale project cannot be
+        # loaded and must be recreated.
+        version_marker = project_path.parent / ".wwise_console"
+        current_console = str(tools.wwise_console_path)
+        if version_marker.exists() and version_marker.read_text(encoding="utf-8").strip() == current_console:
+            return project_path
+        # Mismatch or missing marker — recreate the project.
+        try:
+            shutil.rmtree(project_path.parent)
+        except OSError:
+            pass
 
     project_dir = project_path.parent
     if project_dir.exists():
@@ -221,7 +232,58 @@ def _ensure_blank_wwise_project(project_path: Path, tools: MediaTools) -> Path:
         raise RuntimeError(
             f"Could not create the temporary Wwise project. {guidance}{f' Details: {details}' if details else ''}"
         )
+    # Record which WwiseConsole created this project so we can detect
+    # version mismatches on subsequent runs.
+    version_marker = project_path.parent / ".wwise_console"
+    version_marker.write_text(str(tools.wwise_console_path), encoding="utf-8")
     return project_path
+
+
+_QUALITY_FACTOR_MARKER = 'Name="QualityFactor"'
+_PCM_SELF_CLOSING = 'PluginName="PCM" CompanyID="0" PluginID="1"/>'
+_VORBIS_SELF_CLOSING = 'PluginName="Vorbis" CompanyID="0" PluginID="4"/>'
+_VORBIS_WITH_QUALITY = (
+    'PluginName="Vorbis" CompanyID="0" PluginID="4">\n'
+    "\t\t\t\t\t\t\t\t\t\t\t\t\t\t<PropertyList>\n"
+    '\t\t\t\t\t\t\t\t\t\t\t\t\t\t<Property Name="QualityFactor" Type="Real32" Value="10"/>\n'
+    "\t\t\t\t\t\t\t\t\t\t\t\t\t\t</PropertyList>\n"
+    "\t\t\t\t\t\t\t\t\t\t\t\t\t</ConversionPlugin>"
+)
+
+
+def _ensure_vorbis_default_conversion(project_path: Path) -> None:
+    """Patch the Wwise project's default conversion to high-quality Vorbis.
+
+    Blank Wwise projects (created with ``create-new-project``) default to PCM
+    encoding, which produces uncompressed WEM files incompatible with games
+    that expect Wwise Vorbis.  This rewrites the ``Default Work Unit.wwu``
+    to use Vorbis at maximum quality (``QualityFactor=10``, ~370 kbps stereo)
+    and clears the LMDB cache so the change takes effect.
+
+    The high quality setting matches the codebook configuration used by
+    Dying Light games, ensuring the runtime Vorbis decoder can play back
+    the replacement audio without producing silence.
+    """
+    wwu_path = project_path.parent / "Conversion Settings" / "Default Work Unit.wwu"
+    if not wwu_path.exists():
+        return
+    content = wwu_path.read_text(encoding="utf-8")
+    if _QUALITY_FACTOR_MARKER in content:
+        return  # already fully configured
+    changed = False
+    if _PCM_SELF_CLOSING in content:
+        content = content.replace(_PCM_SELF_CLOSING, _VORBIS_WITH_QUALITY)
+        changed = True
+    elif _VORBIS_SELF_CLOSING in content:
+        content = content.replace(_VORBIS_SELF_CLOSING, _VORBIS_WITH_QUALITY)
+        changed = True
+    if not changed:
+        return
+    wwu_path.write_text(content, encoding="utf-8")
+    # Clear the LMDB cache so WwiseConsole picks up the new conversion settings.
+    cache_dir = project_path.parent / ".cache"
+    if cache_dir.is_dir():
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 def _decode_ffmpeg_to_wav(
@@ -370,6 +432,7 @@ def convert_audio_to_wem(
     conversion_root = Path(work_root).expanduser().resolve()
     conversion_root.mkdir(parents=True, exist_ok=True)
     helper_project = _ensure_blank_wwise_project(conversion_root / "WwiseConvert" / "WwiseConvert.wproj", tools)
+    _ensure_vorbis_default_conversion(helper_project)
     logger = log or (lambda _message: None)
 
     with tempfile.TemporaryDirectory(prefix="dyingaudio_wem_", dir=str(conversion_root)) as temp_dir:
@@ -449,11 +512,12 @@ def convert_audio_to_wem(
             nested_matches = sorted(output_dir.rglob(destination_name))
             if nested_matches:
                 generated = nested_matches[0]
-        if result.returncode not in {0, 1, 2} and not generated.exists():
+        if not generated.exists():
             details = (result.stderr or result.stdout or "").strip()
             authoring_root = _wwise_authoring_root(tools.wwise_console_path)
             raise RuntimeError(
-                "Could not convert the selected file to WEM with WwiseConsole. "
+                "Could not convert the selected file to WEM with WwiseConsole "
+                f"(exit code {result.returncode}, output file not found). "
                 f"WwiseConsole path: {tools.wwise_console_path}. "
                 + (
                     f"Detected Authoring root: {authoring_root}. "

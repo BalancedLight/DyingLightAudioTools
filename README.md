@@ -74,17 +74,37 @@ Replacing or adding raw audio keeps the project in raw-audio mode because DLDT i
 
 ## Dying Light 2 / The Beast (Experimental)
 
-This workspace is intentionally read-only right now.
+This workspace supports browsing and replacing Wwise audio in DL2 and DLTB AESP archives.
 
-It supports:
+### Browsing & Export
 
-- switching between `DL2` and `DLTB`
-- detecting available archive sets such as `base` and `speech_*`
-- building a cached named workspace under `%LOCALAPPDATA%\DyingAudio\wwise_cache`
-- browsing `archive -> bank -> event`
-- previewing and exporting selected media
-- exporting selected event folders, selected bank files, or a full workspace dump
+- Switching between `DL2` and `DLTB`
+- Detecting available archive sets such as `base` and `speech_*` (language packs)
+- Building a cached named workspace under `%LOCALAPPDATA%\DyingAudio\wwise_cache`
+- Browsing `archive → bank → event`
+- Previewing and exporting selected media
+- Exporting selected event folders, selected bank files, or a full workspace dump
 
+### Audio Replacement
+
+Replace any media entry in `sfx`, `streams`, or `meta` archives with custom audio:
+
+1. Install Wwise from [Audiokinetic's website](https://www.audiokinetic.com/en/download) and install Wwise 2023.1.13.8732 (You can probably use a newer version, but this is the one DL2 uses.)
+2. Enable the **"Enable experimental AESP replacement"** checkbox
+3. Select one or more media rows in the media tree
+4. Click **Replace Selected Audio** (or right-click → Replace)
+5. Pick a `.wem`, `.wav`, `.ogg`, `.mp3`, or other audio file
+6. Non-WEM files are automatically converted via a local Wwise installation
+
+**Multi-replacement**: Select multiple rows (Ctrl+Click or Shift+Click) to replace them all with the same audio file in one operation. Useful for replacing grouped or duplicate entries.
+
+**Hide warnings**: Check **"Hide replacement warnings"** to skip sample-rate, duration, and confirmation dialogs. A one-time warning explains what this disables before it takes effect. The setting persists across sessions.
+
+**Backups**: A `.bak` file is created on the first modification to each archive. Use **Restore Original AESP** to undo all replacements at once. BNK metadata in `meta.aesp` is also patched and backed up automatically.
+
+**Speech archives**: Language packs (e.g. `speech_en`) appear as separate archive sets and support the same replacement workflow as `base`.
+
+This is an experimental workflow, but it shows promising results in-game.
 ## Other Workspace
 
 The `Other` tab targets AKPK / `.pck` packs.

@@ -75,6 +75,7 @@ class ExperimentalSettings:
     archive_set: str = DEFAULT_EXPERIMENTAL_ARCHIVE_SET
     cache_root: str = DEFAULT_EXPERIMENTAL_CACHE_ROOT
     last_export_folder: str = ""
+    hide_replacement_warnings: bool = False
 
 
 @dataclass(slots=True)
