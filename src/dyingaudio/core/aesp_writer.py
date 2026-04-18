@@ -1,7 +1,8 @@
 """AESP archive audio replacement via append-and-update-index strategy.
 
 Supports replacing external WEM media in sfx.aesp / streams.aesp archives
-used by Dying Light 2 and Dying Light: The Beast.  The archive is modified
+and embedded WEM media inside BNK entries in meta.aesp, as used by
+Dying Light 2 and Dying Light: The Beast.  The archive is modified
 in-place: replacement data is appended to the end of the file and the
 corresponding index entry is updated to point to the new data.  A ``.bak``
 backup is created on the first modification.
@@ -274,6 +275,230 @@ def _patch_bnk_media_size_in_meta(
                         obj_pos += 5 + obj_size
                 pos += 8 + sec_size
     return patches_applied
+
+def _rebuild_bank_with_replacement(
+    bank_data: bytes,
+    media_id: int,
+    replacement_wem: bytes,
+) -> bytes:
+    """Return a new BNK blob with *media_id*'s WEM replaced in DIDX/DATA.
+
+    Also patches the HIRC ``in_memory_media_size`` field for any Sound
+    object that references *media_id*.
+    """
+    media_id_bytes = struct.pack("<I", media_id)
+    new_size = len(replacement_wem)
+    new_size_bytes = struct.pack("<I", new_size)
+
+    # Parse chunks
+    chunks: list[tuple[bytes, bytes]] = []  # (chunk_id_4bytes, payload)
+    pos = 0
+    didx_index: int | None = None
+    data_index: int | None = None
+    hirc_index: int | None = None
+
+    while pos + 8 <= len(bank_data):
+        chunk_id = bank_data[pos : pos + 4]
+        chunk_size = struct.unpack_from("<I", bank_data, pos + 4)[0]
+        payload = bank_data[pos + 8 : pos + 8 + chunk_size]
+        idx = len(chunks)
+        if chunk_id == b"DIDX":
+            didx_index = idx
+        elif chunk_id == b"DATA":
+            data_index = idx
+        elif chunk_id == b"HIRC":
+            hirc_index = idx
+        chunks.append((chunk_id, payload))
+        pos += 8 + chunk_size
+
+    if didx_index is None or data_index is None:
+        raise RuntimeError("BNK does not contain DIDX/DATA sections — cannot replace embedded media.")
+
+    # Parse DIDX entries — each is 12 bytes: media_id(u32), rel_offset(u32), size(u32)
+    didx_payload = chunks[didx_index][1]
+    entry_count = len(didx_payload) // 12
+    didx_entries: list[tuple[int, int, int]] = []
+    target_idx: int | None = None
+    for i in range(entry_count):
+        mid, rel_off, sz = struct.unpack_from("<III", didx_payload, i * 12)
+        didx_entries.append((mid, rel_off, sz))
+        if mid == media_id:
+            target_idx = i
+
+    if target_idx is None:
+        raise RuntimeError(f"Media ID {media_id} not found in BNK DIDX ({entry_count} entries).")
+
+    # Rebuild DATA payload with the replacement WEM spliced in
+    old_data_payload = chunks[data_index][1]
+    old_mid, old_rel_offset, old_size = didx_entries[target_idx]
+    size_delta = new_size - old_size
+
+    new_data_payload = bytearray()
+    new_data_payload.extend(old_data_payload[:old_rel_offset])
+    new_data_payload.extend(replacement_wem)
+    new_data_payload.extend(old_data_payload[old_rel_offset + old_size :])
+
+    # Rebuild DIDX with updated offsets and size
+    new_didx_payload = bytearray()
+    for i, (mid, rel_off, sz) in enumerate(didx_entries):
+        if i == target_idx:
+            new_didx_payload.extend(struct.pack("<III", mid, rel_off, new_size))
+        elif rel_off > old_rel_offset:
+            new_didx_payload.extend(struct.pack("<III", mid, rel_off + size_delta, sz))
+        else:
+            new_didx_payload.extend(struct.pack("<III", mid, rel_off, sz))
+
+    chunks[didx_index] = (b"DIDX", bytes(new_didx_payload))
+    chunks[data_index] = (b"DATA", bytes(new_data_payload))
+
+    # Patch HIRC Sound objects referencing this media_id
+    if hirc_index is not None:
+        hirc_payload = bytearray(chunks[hirc_index][1])
+        obj_count = struct.unpack_from("<I", hirc_payload, 0)[0]
+        obj_pos = 4
+        for _ in range(obj_count):
+            if obj_pos + 5 > len(hirc_payload):
+                break
+            obj_type = hirc_payload[obj_pos]
+            obj_size = struct.unpack_from("<I", hirc_payload, obj_pos + 1)[0]
+            obj_data_start = obj_pos + 5
+            if obj_type == _BNK_HIRC_SOUND_TYPE and obj_size >= 17:
+                src_id_off = obj_data_start + _HIRC_SOUND_SOURCE_ID_OFFSET
+                if hirc_payload[src_id_off : src_id_off + 4] == media_id_bytes:
+                    mem_size_off = obj_data_start + _HIRC_SOUND_IN_MEM_SIZE_OFFSET
+                    hirc_payload[mem_size_off : mem_size_off + 4] = new_size_bytes
+            obj_pos += 5 + obj_size
+        chunks[hirc_index] = (b"HIRC", bytes(hirc_payload))
+
+    # Reassemble
+    result = bytearray()
+    for chunk_id, payload in chunks:
+        result.extend(chunk_id)
+        result.extend(struct.pack("<I", len(payload)))
+        result.extend(payload)
+    return bytes(result)
+
+
+def _find_bank_containing_media(
+    meta_path: Path,
+    media_id: int,
+) -> tuple[int, AespEntry, bytes] | None:
+    """Scan meta.aesp banks for one whose DIDX references *media_id*.
+
+    Returns ``(entry_file_offset, entry, bank_data)`` or ``None``.
+    """
+    entry_start, entry_count = _read_aesp_header(meta_path)
+    media_id_bytes = struct.pack("<I", media_id)
+    with meta_path.open("rb") as handle:
+        for index in range(entry_count):
+            entry_offset = entry_start + index * AESP_ENTRY_SIZE
+            entry = _parse_entry_at(handle, entry_offset)
+            if entry.data_size < 16:
+                continue
+            handle.seek(entry.data_offset)
+            magic = handle.read(4)
+            if magic != b"BKHD":
+                continue
+            # Quick scan: look for DIDX and check for the media_id
+            handle.seek(entry.data_offset)
+            bank_data = handle.read(entry.data_size)
+            pos = 0
+            while pos + 8 <= len(bank_data):
+                chunk_id = bank_data[pos : pos + 4]
+                chunk_size = struct.unpack_from("<I", bank_data, pos + 4)[0]
+                if chunk_id == b"DIDX":
+                    didx_start = pos + 8
+                    didx_end = didx_start + chunk_size
+                    scan = didx_start
+                    while scan + 12 <= didx_end:
+                        if bank_data[scan : scan + 4] == media_id_bytes:
+                            return entry_offset, entry, bank_data
+                        scan += 12
+                    break  # DIDX scanned, not found in this bank
+                pos += 8 + chunk_size
+    return None
+
+
+def replace_aesp_bank_media(
+    meta_path: str | Path,
+    media_id: int,
+    replacement_path: str | Path,
+    log: LogCallback,
+    *,
+    progress: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> AespReplacementResult:
+    """Replace an embedded WEM inside a BNK entry in meta.aesp.
+
+    Finds the bank containing *media_id* in its DIDX, rebuilds the bank
+    with the replacement WEM, appends the rebuilt bank to meta.aesp, and
+    updates the AESP index entry.
+    """
+    resolved_meta = Path(meta_path).expanduser().resolve()
+    resolved_replacement = Path(replacement_path).expanduser().resolve()
+
+    if not resolved_meta.exists():
+        raise FileNotFoundError(f"Archive not found: {resolved_meta}")
+    if not resolved_replacement.exists():
+        raise FileNotFoundError(f"Replacement file not found: {resolved_replacement}")
+
+    replacement_bytes = resolved_replacement.read_bytes()
+    if not replacement_bytes:
+        raise ValueError(f"Replacement file is empty: {resolved_replacement}")
+    if replacement_bytes[:4] != RIFF_MAGIC:
+        raise ValueError(
+            f"Replacement file does not start with a RIFF header: {resolved_replacement.name}."
+        )
+
+    _raise_if_cancelled(cancel_event)
+
+    if progress is not None:
+        progress(f"Scanning banks in {resolved_meta.name} for media {media_id}...", 0, 3)
+
+    result = _find_bank_containing_media(resolved_meta, media_id)
+    if result is None:
+        entry_start, entry_count = _read_aesp_header(resolved_meta)
+        raise RuntimeError(
+            f"Media ID {media_id} not found in any bank in '{resolved_meta.name}' ({entry_count} entries scanned)."
+        )
+    entry_offset, entry, bank_data = result
+    log(f"Found media {media_id} in bank '{entry.ascii_name}' (offset 0x{entry.data_offset:X}, {entry.data_size:,} bytes).")
+
+    _raise_if_cancelled(cancel_event)
+
+    if progress is not None:
+        progress(f"Rebuilding bank '{entry.ascii_name}' with replacement...", 1, 3)
+    new_bank_data = _rebuild_bank_with_replacement(bank_data, media_id, replacement_bytes)
+    log(f"Rebuilt bank '{entry.ascii_name}': {len(bank_data):,} -> {len(new_bank_data):,} bytes.")
+
+    _raise_if_cancelled(cancel_event)
+
+    if progress is not None:
+        progress(f"Writing rebuilt bank to {resolved_meta.name}...", 2, 3)
+    backup_path = _ensure_aesp_backup(resolved_meta)
+    new_offset = _append_data(resolved_meta, new_bank_data)
+    _update_aesp_entry_in_place(resolved_meta, entry_offset, new_offset, len(new_bank_data))
+    log(f"Replaced bank '{entry.ascii_name}' in {resolved_meta.name}: new offset 0x{new_offset:X}.")
+
+    _log_replacement(
+        resolved_meta,
+        media_id,
+        entry.data_offset,
+        entry.data_size,
+        new_offset,
+        len(new_bank_data),
+        resolved_replacement,
+    )
+
+    return AespReplacementResult(
+        archive_path=resolved_meta,
+        backup_path=backup_path,
+        media_id=media_id,
+        replacement_path=resolved_replacement,
+        replacement_size=len(replacement_bytes),
+        new_offset=new_offset,
+    )
+
 
 def _log_replacement(
     archive_path: Path,

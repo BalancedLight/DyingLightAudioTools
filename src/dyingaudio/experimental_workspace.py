@@ -14,12 +14,14 @@ from dyingaudio.audio_info import AudioMetadata, probe_audio_metadata
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
 from dyingaudio.core.aesp_writer import (
     AespReplacementResult,
+    replace_aesp_bank_media,
     replace_aesp_external_media,
     restore_aesp_from_backup,
 )
 from dyingaudio.core.media_tools import (
     COMMON_AUDIO_FILETYPES,
     convert_audio_to_wem,
+    decode_audio_to_wav,
     discover_media_tools,
     ensure_portable_tool_layout,
     missing_wem_conversion_requirements,
@@ -1884,6 +1886,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
         replacement_rows = list(rows)
         conversion_root = self.workspace.root / "replacement_conversion"
         meta_archive_path = self._resolve_archive_path("meta")
+        # Capture source paths for post-replacement preview refresh
+        row_source_paths = {r.media_id: r.source for r in replacement_rows}
 
         def worker(progress, log):
             normalized_path = replacement_path
@@ -1905,21 +1909,46 @@ class ExperimentalWwiseFrame(ttk.Frame):
                         len(replacement_rows) + 1,
                     )
                 target_archive_path = self._resolve_archive_path(target_row.archive)
-                result = replace_aesp_external_media(
-                    target_archive_path,
-                    target_row.media_id,
-                    normalized_path,
-                    log,
-                    meta_path=meta_archive_path,
-                    progress=progress,
-                    cancel_event=self.task_runner.cancel_event,
-                )
+                if target_row.archive == "meta":
+                    result = replace_aesp_bank_media(
+                        target_archive_path,
+                        target_row.media_id,
+                        normalized_path,
+                        log,
+                        progress=progress,
+                        cancel_event=self.task_runner.cancel_event,
+                    )
+                else:
+                    result = replace_aesp_external_media(
+                        target_archive_path,
+                        target_row.media_id,
+                        normalized_path,
+                        log,
+                        meta_path=meta_archive_path,
+                        progress=progress,
+                        cancel_event=self.task_runner.cancel_event,
+                    )
                 results.append(result)
+
+            # Decode the replacement WEM to overwrite flat source WAVs so
+            # preview plays the new audio instead of the old cached version.
+            for item in results:
+                source_wav = row_source_paths.get(item.media_id)
+                if source_wav is not None:
+                    try:
+                        decode_audio_to_wav(normalized_path, source_wav, log=log)
+                        log(f"Updated preview source for media {item.media_id}.")
+                    except Exception as exc:
+                        log(f"Warning: could not update preview for media {item.media_id}: {exc}")
+
             return results
 
         def on_success(result: object) -> None:
             if not isinstance(result, list):
                 return
+            # Clear preview cache so the updated WAV files are picked up.
+            self.preview_player.clear_cache()
+            media_signature_for_path.cache_clear()
             for item in result:
                 if isinstance(item, AespReplacementResult):
                     self._append_status(
