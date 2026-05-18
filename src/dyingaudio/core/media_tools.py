@@ -17,6 +17,20 @@ COMMON_AUDIO_FILETYPES = [
     ("Audio files", "*.ogg *.wav *.mp3 *.flac *.m4a *.aac *.wma *.opus *.mp4"),
     ("All files", "*.*"),
 ]
+DEFAULT_AUDIO_EXPORT_SUFFIX = ".ogg"
+DL1_AUDIO_QUALITY_CHOICES = (
+    "Vorbis q10",
+    "Vorbis q8",
+    "Vorbis q6",
+    "Vorbis q4",
+    "Vorbis q2",
+    "PCM WAV",
+)
+AUDIO_EXPORT_FILETYPES = [
+    ("Ogg Vorbis files", "*.ogg"),
+    ("WAV files", "*.wav"),
+    *COMMON_AUDIO_FILETYPES,
+]
 
 WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
@@ -359,6 +373,142 @@ def _convert_to_wav(source: Path, destination: Path, tools: MediaTools) -> Path:
     )
 
 
+def audio_quality_output_suffix(audio_quality: str | None) -> str:
+    normalized = (audio_quality or "").strip().casefold()
+    if normalized == "pcm wav":
+        return ".wav"
+    return DEFAULT_AUDIO_EXPORT_SUFFIX
+
+
+def vorbis_quality_factor(audio_quality: str | None) -> int:
+    normalized = (audio_quality or "").strip().casefold()
+    if normalized.startswith("vorbis q"):
+        raw_value = normalized.removeprefix("vorbis q").strip()
+        try:
+            return max(0, min(10, int(raw_value)))
+        except ValueError:
+            return 10
+    return 10
+
+
+def _decode_supported_audio_to_wav(
+    source: Path,
+    destination: Path,
+    tools: MediaTools,
+    logger: Callable[[str], None],
+) -> Path:
+    if source.suffix.lower() in {".fsb", ".wem"}:
+        return _decode_vgmstream_to_wav(
+            source,
+            destination,
+            tools,
+            logger,
+            label=f"'{source.name}'",
+        )
+    return decode_audio_to_wav(source, destination, log=logger, tools=tools)
+
+
+def _transcode_ffmpeg_audio(
+    source: Path,
+    destination: Path,
+    tools: MediaTools,
+    logger: Callable[[str], None],
+    *,
+    failure_label: str,
+    vorbis_quality: int | None = None,
+) -> Path:
+    if tools.ffmpeg_path is None:
+        raise RuntimeError(f"FFmpeg is required to export {failure_label}.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(tools.ffmpeg_path),
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-vn",
+    ]
+    if destination.suffix.lower() == ".ogg":
+        command.extend(["-c:a", "libvorbis", "-q:a", str(vorbis_quality if vorbis_quality is not None else 10)])
+    command.append(str(destination))
+    logger(" ".join(command))
+    result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if result.stdout.strip():
+        logger(result.stdout.strip())
+    if result.stderr.strip():
+        logger(result.stderr.strip())
+    if result.returncode != 0 or not destination.exists():
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Could not export {failure_label}.{f' {details}' if details else ''}")
+    return destination
+
+
+def export_audio_file(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    tools: MediaTools | None = None,
+    audio_quality: str | None = None,
+) -> Path:
+    resolved_source = Path(source).expanduser().resolve()
+    if not resolved_source.exists():
+        raise FileNotFoundError(f"Missing audio source: {resolved_source}")
+
+    destination_path = Path(destination).expanduser().resolve()
+    logger = log or (lambda _message: None)
+    tools = tools or discover_media_tools()
+    suffix = destination_path.suffix.lower()
+    if suffix not in {".ogg", ".wav"}:
+        raise ValueError(f"Unsupported export format '{destination_path.suffix or 'none'}'. Choose .ogg or .wav.")
+
+    if suffix == ".wav":
+        return _decode_supported_audio_to_wav(resolved_source, destination_path, tools, logger)
+
+    working_source = resolved_source
+    with tempfile.TemporaryDirectory(prefix="dyingaudio_export_audio_") as temp_dir:
+        temp_root = Path(temp_dir)
+        if resolved_source.suffix.lower() in {".fsb", ".wem"}:
+            working_source = _decode_supported_audio_to_wav(resolved_source, temp_root / "decoded.wav", tools, logger)
+        return _transcode_ffmpeg_audio(
+            working_source,
+            destination_path,
+            tools,
+            logger,
+            failure_label=f"'{resolved_source.name}' to {destination_path.suffix}",
+            vorbis_quality=vorbis_quality_factor(audio_quality),
+        )
+
+
+def prepare_audio_for_fsb(
+    source: str | Path,
+    destination_stem: str | Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    tools: MediaTools | None = None,
+    audio_quality: str | None = None,
+) -> Path:
+    resolved_source = Path(source).expanduser().resolve()
+    if not resolved_source.exists():
+        raise FileNotFoundError(f"Missing audio source: {resolved_source}")
+
+    destination_root = Path(destination_stem).expanduser().resolve()
+    logger = log or (lambda _message: None)
+    tools = tools or discover_media_tools()
+    destination = destination_root.with_suffix(audio_quality_output_suffix(audio_quality))
+
+    if destination.suffix.lower() == ".wav":
+        return decode_audio_to_wav(resolved_source, destination, log=logger, tools=tools)
+    return export_audio_file(
+        resolved_source,
+        destination,
+        log=logger,
+        tools=tools,
+        audio_quality=audio_quality,
+    )
+
+
 def _write_wsources(path: Path, source_path: Path, destination_name: str) -> Path:
     xml_text = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -556,7 +706,7 @@ def missing_wem_conversion_requirements(
     return missing
 
 
-def ffprobe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, str] | None:
+def ffprobe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, int, str] | None:
     if tools.ffprobe_path is None:
         return None
 
@@ -566,7 +716,7 @@ def ffprobe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, str]
         "-v",
         "error",
         "-show_entries",
-        "stream=sample_rate:format=duration",
+        "stream=sample_rate,channels:format=duration",
         "-of",
         "json",
         str(source),
@@ -583,24 +733,32 @@ def ffprobe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, str]
     duration_raw = payload.get("format", {}).get("duration")
     streams = payload.get("streams", [])
     stream_rate = 0
+    channel_count = 0
     for stream in streams:
         sample_rate = stream.get("sample_rate")
         if sample_rate:
             try:
                 stream_rate = int(sample_rate)
-                break
             except ValueError:
                 continue
+        channels = stream.get("channels")
+        if channels:
+            try:
+                channel_count = int(channels)
+            except ValueError:
+                channel_count = 0
+        if stream_rate > 0 and channel_count > 0:
+            break
 
     try:
         duration_seconds = float(duration_raw)
     except (TypeError, ValueError):
         return None
 
-    return duration_seconds, stream_rate, "Metadata loaded via ffprobe."
+    return duration_seconds, stream_rate, channel_count, "Metadata loaded via ffprobe."
 
 
-def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, int, str] | None:
+def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, int, int, int, str] | None:
     if tools.vgmstream_path is None:
         return None
 
@@ -611,6 +769,7 @@ def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, i
         return None
 
     sample_rate = 0
+    channel_count = 0
     sample_count = 0
     for raw_line in result.stdout.splitlines():
         line = raw_line.strip()
@@ -619,6 +778,11 @@ def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, i
                 sample_rate = int(line.split(":", 1)[1].strip().split()[0])
             except (IndexError, ValueError):
                 sample_rate = 0
+        elif line.startswith("channels:"):
+            try:
+                channel_count = int(line.split(":", 1)[1].strip().split()[0])
+            except (IndexError, ValueError):
+                channel_count = 0
         elif line.startswith("stream total samples:"):
             try:
                 sample_count = int(line.split(":", 1)[1].strip().split()[0])
@@ -627,4 +791,4 @@ def vgmstream_probe_audio(path: str | Path, tools: MediaTools) -> tuple[float, i
 
     if sample_rate <= 0 or sample_count <= 0:
         return None
-    return sample_count / float(sample_rate), sample_rate, sample_count, "Metadata loaded via vgmstream."
+    return sample_count / float(sample_rate), sample_rate, channel_count, sample_count, "Metadata loaded via vgmstream."

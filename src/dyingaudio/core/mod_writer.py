@@ -9,7 +9,7 @@ from typing import Callable
 from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.core.csb import WORKSHOP_MAGIC, pack_csb
 from dyingaudio.core.dldt import DldtToolchain, compile_audio_to_fsb
-from dyingaudio.core.media_tools import discover_media_tools, run_hidden
+from dyingaudio.core.media_tools import prepare_audio_for_fsb
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.models import AudioEntry
 
@@ -45,6 +45,7 @@ def _compile_entries(
     toolchain: DldtToolchain,
     work_root: Path,
     log: Callable[[str], None],
+    audio_quality: str,
     progress: Callable[[str, float | None, float | None], None] | None = None,
     progress_offset: int = 0,
     progress_total: int | None = None,
@@ -55,7 +56,6 @@ def _compile_entries(
     cache_dir.mkdir(parents=True, exist_ok=True)
     fsb_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    media_tools = discover_media_tools()
 
     compiled_entries: list[AudioEntry] = []
     total = progress_total or max(len(entries), 1)
@@ -70,36 +70,21 @@ def _compile_entries(
         if source_path is None or not source_path.exists():
             raise FileNotFoundError(f"Missing audio source for '{entry.entry_name}'.")
 
-        compile_source_path = source_path
-        if source_path.suffix.lower() not in {".wav", ".ogg"}:
-            if media_tools.ffmpeg_path is None:
-                raise RuntimeError(
-                    f"FFmpeg is required to convert '{source_path.suffix or 'unknown'}' files for '{entry.entry_name}'."
-                )
-            compile_source_path = raw_dir / f"{_safe_temp_name(entry, source_path)}.wav"
-            command = [
-                str(media_tools.ffmpeg_path),
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(source_path),
-                "-acodec",
-                "pcm_s16le",
-                str(compile_source_path),
-            ]
-            log(" ".join(command))
-            result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-            if result.stdout.strip():
-                log(result.stdout.strip())
-            if result.stderr.strip():
-                log(result.stderr.strip())
-            if result.returncode != 0 or not compile_source_path.exists():
-                raise RuntimeError(f"Could not convert '{source_path.name}' for '{entry.entry_name}'.")
-
+        compile_source_path = prepare_audio_for_fsb(
+            source_path,
+            raw_dir / _safe_temp_name(entry, source_path),
+            log=log,
+            audio_quality="PCM WAV",
+        )
         metadata = probe_audio_metadata(source_path)
         output_path = fsb_dir / f"{entry.entry_name}.fsb"
-        result = compile_audio_to_fsb(toolchain, compile_source_path, output_path, cache_dir)
+        result = compile_audio_to_fsb(
+            toolchain,
+            compile_source_path,
+            output_path,
+            cache_dir,
+            audio_quality=audio_quality,
+        )
         log(" ".join(result.command))
         if result.stdout:
             log(result.stdout)
@@ -159,6 +144,7 @@ def _prepare_entries(
     toolchain: DldtToolchain | None,
     work_root: Path,
     log: Callable[[str], None],
+    audio_quality: str,
     progress: Callable[[str, float | None, float | None], None] | None = None,
 ) -> list[AudioEntry]:
     prepared_entries: list[AudioEntry] = []
@@ -183,6 +169,7 @@ def _prepare_entries(
                 toolchain,
                 work_root,
                 log,
+                audio_quality,
                 progress=progress,
                 progress_offset=index,
                 progress_total=total,
@@ -205,6 +192,7 @@ def build_mod(
     builder_mode: str,
     toolchain: DldtToolchain | None,
     log: Callable[[str], None],
+    audio_quality: str = "Vorbis q10",
     magic: int | None = WORKSHOP_MAGIC,
     progress: Callable[[str, float | None, float | None], None] | None = None,
 ) -> BuildArtifacts:
@@ -226,6 +214,7 @@ def build_mod(
         entries=entries,
         output_path=data_root / f"{bundle_name}.csb",
         builder_mode=builder_mode,
+        audio_quality=audio_quality,
         toolchain=toolchain,
         log=log,
         magic=magic,
@@ -257,6 +246,7 @@ def build_csb_file(
     builder_mode: str,
     toolchain: DldtToolchain | None,
     log: Callable[[str], None],
+    audio_quality: str = "Vorbis q10",
     magic: int | None = WORKSHOP_MAGIC,
     progress: Callable[[str, float | None, float | None], None] | None = None,
 ) -> CsbBuildArtifacts:
@@ -266,7 +256,15 @@ def build_csb_file(
 
     with tempfile.TemporaryDirectory(prefix="dyingaudio_build_") as temp_dir:
         temp_root = Path(temp_dir)
-        prepared_entries = _prepare_entries(entries, builder_mode, toolchain, temp_root, log, progress=progress)
+        prepared_entries = _prepare_entries(
+            entries,
+            builder_mode,
+            toolchain,
+            temp_root,
+            log,
+            audio_quality,
+            progress=progress,
+        )
         pack_csb(prepared_entries, destination, magic=magic, progress=progress)
 
     return CsbBuildArtifacts(csb_path=destination, built_entries=prepared_entries)

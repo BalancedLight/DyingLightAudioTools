@@ -33,6 +33,7 @@ Or with the included helper:
 ### Requirements
 
 For some editing behaviour, you will need to have **Dying Light Developer Tools** installed. 
+You may also need to install ffmpeg.
 
 ### Create a new DL1 audio project
 
@@ -48,7 +49,7 @@ For some editing behaviour, you will need to have **Dying Light Developer Tools*
 1. Click `Open CSB For Edit`.
 2. Select the entry you want to change.
 3. Click `Replace Audio / FSB`.
-4. Choose a raw audio file or an `.fsb`.
+4. Choose a raw audio file such as `.mp3`, `.ogg`, or `.wav`, or pick an `.fsb`.
 5. Preview, adjust entry details if needed, then save or build.
 
 
@@ -64,11 +65,17 @@ For some editing behaviour, you will need to have **Dying Light Developer Tools*
 
 Replacing or adding raw audio keeps the project in raw-audio mode because DLDT is required to compile those files.
 
+### Audio Quality
+
+- `Audio Quality` controls how raw DL1 audio is normalized before rebuilt banks are compiled
+- Vorbis presets rebuild through `.ogg` intermediates and also become the default export format for `Export Audio` and decoded `Extract CSB`
+- `PCM WAV` keeps decoded exports and rebuild intermediates as `.wav` (Very high file sizes!)
+
 ### Useful DL1 actions
 
 - `Preview`: play the selected entry directly from the source file or extracted FSB data
 - `Inspect CSB`: view entry names, channel info, duration, samples, and notes without opening for edit
-- `Extract CSB`: unpack embedded FSBs from an existing bundle
+- `Extract CSB`: unpack embedded FSBs from an existing bundle, or export decoded audio plus a reusable manifest
 - Right-click an entry for replace, export, duplicate, rename, or remove
 - Search and sort the entry list without losing the original underlying entry indices
 

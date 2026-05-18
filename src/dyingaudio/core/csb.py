@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Callable
 
+from dyingaudio.core.media_tools import audio_quality_output_suffix, export_audio_file
 from dyingaudio.models import AudioEntry
 
 
@@ -206,41 +208,79 @@ def extract_csb(
     path: str | Path,
     output_dir: str | Path,
     progress: ProgressCallback | None = None,
+    *,
+    output_format: str = "fsb",
+    audio_quality: str | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> list[AudioEntry]:
     parsed = parse_csb(path)
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
+    mode = output_format.strip().lower()
+    if mode not in {"fsb", "audio"}:
+        raise ValueError(f"Unsupported CSB extraction format '{output_format}'.")
+    logger = log or (lambda _message: None)
 
     extracted_entries: list[AudioEntry] = []
     total = max(len(parsed.entries), 1)
-    for index, entry in enumerate(parsed.entries):
-        if progress is not None:
-            progress(f"Extracting {entry.entry_name} ({index + 1}/{len(parsed.entries)})", index, total)
-        base = parsed.table_offset + (index * ENTRY_SIZE)
-        offset = _read_u32(parsed.raw_bytes, base + 64)
-        size = _read_u32(parsed.raw_bytes, base + 68)
-        fsb_path = destination / f"{entry.entry_name}.fsb"
-        payload, trailing_bytes = normalize_fsb_payload(parsed.raw_bytes[offset:offset + size])
-        fsb_path.write_bytes(payload)
-
-        extracted_entries.append(
-            AudioEntry(
-                entry_name=entry.entry_name,
-                source_path=str(fsb_path),
-                source_mode="fsb",
-                fsb_path=str(fsb_path),
-                entry_type=entry.entry_type,
-                sample_count=entry.sample_count,
-                duration_ms=entry.duration_ms,
-                reserved=entry.reserved,
-                notes="Extracted from CSB."
+    with tempfile.TemporaryDirectory(prefix="dyingaudio_extract_csb_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for index, entry in enumerate(parsed.entries):
+            if progress is not None:
+                progress(f"Extracting {entry.entry_name} ({index + 1}/{len(parsed.entries)})", index, total)
+            base = parsed.table_offset + (index * ENTRY_SIZE)
+            offset = _read_u32(parsed.raw_bytes, base + 64)
+            size = _read_u32(parsed.raw_bytes, base + 68)
+            payload, trailing_bytes = normalize_fsb_payload(parsed.raw_bytes[offset:offset + size])
+            notes = (
+                "Extracted from CSB."
                 if trailing_bytes <= 0
-                else f"Extracted from CSB. Trimmed {trailing_bytes} trailing byte(s) from embedded FSB.",
+                else f"Extracted from CSB. Trimmed {trailing_bytes} trailing byte(s) from embedded FSB."
             )
-        )
+
+            if mode == "fsb":
+                fsb_path = destination / f"{entry.entry_name}.fsb"
+                fsb_path.write_bytes(payload)
+                extracted_entries.append(
+                    AudioEntry(
+                        entry_name=entry.entry_name,
+                        source_path=str(fsb_path),
+                        source_mode="fsb",
+                        fsb_path=str(fsb_path),
+                        entry_type=entry.entry_type,
+                        sample_count=entry.sample_count,
+                        duration_ms=entry.duration_ms,
+                        reserved=entry.reserved,
+                        notes=notes,
+                    )
+                )
+                continue
+
+            temp_fsb_path = temp_root / f"{entry.entry_name}.fsb"
+            temp_fsb_path.write_bytes(payload)
+            export_path = destination / f"{entry.entry_name}{audio_quality_output_suffix(audio_quality)}"
+            export_audio_file(
+                temp_fsb_path,
+                export_path,
+                log=logger,
+                audio_quality=audio_quality,
+            )
+            extracted_entries.append(
+                AudioEntry(
+                    entry_name=entry.entry_name,
+                    source_path=str(export_path),
+                    source_mode="raw",
+                    entry_type=entry.entry_type,
+                    sample_count=entry.sample_count,
+                    duration_ms=entry.duration_ms,
+                    reserved=entry.reserved,
+                    notes=f"{notes} Exported as audio.",
+                )
+            )
 
     if progress is not None:
-        progress(f"Extracted {len(extracted_entries)} FSB file(s).", total, total)
+        output_label = "audio file(s)" if mode == "audio" else "FSB file(s)"
+        progress(f"Extracted {len(extracted_entries)} {output_label}.", total, total)
     return extracted_entries
 
 

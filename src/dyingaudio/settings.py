@@ -17,6 +17,7 @@ DEFAULT_DLTB_ROOT = ""
 DEFAULT_AUDIO_PROCS = ["map_default", "example"]
 DEFAULT_MOD_NAME = "ReAudio"
 DEFAULT_BUNDLE_NAME = "workshop_audio"
+DEFAULT_DL1_AUDIO_QUALITY = "Vorbis q10"
 DEFAULT_EXPERIMENTAL_GAME = "DLTB"
 DEFAULT_EXPERIMENTAL_ARCHIVE_SET = "base"
 DEFAULT_EXPERIMENTAL_CACHE_ROOT = str(Path(os.environ.get("LOCALAPPDATA", "")) / "DyingAudio" / "wwise_cache")
@@ -60,6 +61,7 @@ class DL1Settings:
     mods_root: str = DEFAULT_MODS_ROOT
     dldt_root: str = DEFAULT_DLDT_ROOT
     builder_mode: str = "Raw Audio via DLDT"
+    audio_quality: str = DEFAULT_DL1_AUDIO_QUALITY
     mod_name: str = DEFAULT_MOD_NAME
     bundle_name: str = DEFAULT_BUNDLE_NAME
     generate_audiodata: bool = True
@@ -108,6 +110,10 @@ class AppSettings:
     @property
     def mod_name(self) -> str:
         return self.dl1.mod_name
+
+    @property
+    def audio_quality(self) -> str:
+        return self.dl1.audio_quality
 
     @property
     def bundle_name(self) -> str:
@@ -258,6 +264,7 @@ def _migrate_legacy_settings(payload: dict[str, Any]) -> AppSettings:
         "mods_root": payload.get("mods_root", settings.dl1.mods_root),
         "dldt_root": payload.get("dldt_root", settings.dl1.dldt_root),
         "builder_mode": payload.get("builder_mode", settings.dl1.builder_mode),
+        "audio_quality": payload.get("audio_quality", settings.dl1.audio_quality),
         "mod_name": payload.get("mod_name", settings.dl1.mod_name),
         "bundle_name": payload.get("bundle_name", settings.dl1.bundle_name),
         "generate_audiodata": payload.get("generate_audiodata", settings.dl1.generate_audiodata),
@@ -293,6 +300,8 @@ def load_settings() -> AppSettings:
 
     if not settings.dl1.audio_proc_names:
         settings.dl1.audio_proc_names = list(DEFAULT_AUDIO_PROCS)
+    if not settings.dl1.audio_quality:
+        settings.dl1.audio_quality = DEFAULT_DL1_AUDIO_QUALITY
     if not settings.experimental.cache_root:
         settings.experimental.cache_root = DEFAULT_EXPERIMENTAL_CACHE_ROOT
     if not settings.experimental.archive_set:

@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dyingaudio.core.media_tools import run_hidden
+from dyingaudio.core.media_tools import run_hidden, vorbis_quality_factor
 
 
 @dataclass(slots=True)
@@ -72,6 +72,8 @@ def compile_audio_to_fsb(
     source_path: str | Path,
     output_path: str | Path,
     cache_dir: str | Path,
+    *,
+    audio_quality: str | None = None,
 ) -> CommandResult:
     source = Path(source_path).resolve()
     output = Path(output_path).resolve()
@@ -88,6 +90,18 @@ def compile_audio_to_fsb(
         "-cache",
         str(cache),
     ]
+    normalized_quality = (audio_quality or "").strip().casefold()
+    if normalized_quality and normalized_quality != "pcm wav":
+        command.extend(
+            [
+                "-format",
+                "OGG",
+                "-quality",
+                str(vorbis_quality_factor(audio_quality) * 10),
+                "-target_samplerate",
+                "48000",
+            ]
+        )
 
     result = run_hidden(
         command,

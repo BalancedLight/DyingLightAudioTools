@@ -17,7 +17,16 @@ from dyingaudio.background import BackgroundTaskRunner, TaskProgress
 from dyingaudio.core.csb import WORKSHOP_MAGIC, extract_csb, parse_csb
 from dyingaudio.core.dldt import DldtToolchain, compile_audio_to_fsb, discover_toolchain
 from dyingaudio.core.manifest import load_manifest, write_manifest
-from dyingaudio.core.media_tools import COMMON_AUDIO_FILETYPES, discover_media_tools, run_hidden
+from dyingaudio.core.media_tools import (
+    AUDIO_EXPORT_FILETYPES,
+    COMMON_AUDIO_FILETYPES,
+    DL1_AUDIO_QUALITY_CHOICES,
+    audio_quality_output_suffix,
+    decode_audio_to_wav,
+    discover_media_tools,
+    export_audio_file,
+    run_hidden,
+)
 from dyingaudio.core.mod_writer import build_csb_file, build_mod
 from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
@@ -36,6 +45,7 @@ from dyingaudio.settings import (
     AppSettings,
     DEFAULT_AUDIO_PROCS,
     DEFAULT_BUNDLE_NAME,
+    DEFAULT_DL1_AUDIO_QUALITY,
     DEFAULT_MOD_NAME,
     bundled_resource_root,
     discover_dldt_root,
@@ -86,6 +96,7 @@ class DyingAudioApp(tk.Tk):
         self.mods_root_var = tk.StringVar(value=self.settings.mods_root)
         self.dldt_root_var = tk.StringVar(value=self.settings.dldt_root)
         self.builder_mode_var = tk.StringVar(value=self.settings.builder_mode or "Raw Audio via DLDT")
+        self.audio_quality_var = tk.StringVar(value=self.settings.audio_quality or DEFAULT_DL1_AUDIO_QUALITY)
         self.generate_script_var = tk.BooleanVar(value=self.settings.generate_audiodata)
         self.status_var = tk.StringVar(value="Ready.")
         self.toolchain_status_var = tk.StringVar(value="")
@@ -145,6 +156,7 @@ class DyingAudioApp(tk.Tk):
             self.generate_script_var,
             self.dldt_root_var,
             self.builder_mode_var,
+            self.audio_quality_var,
         ):
             traced_var.trace_add("write", self._on_settings_changed)
         self.entry_search_var.trace_add("write", self._on_entry_filter_changed)
@@ -325,7 +337,7 @@ class DyingAudioApp(tk.Tk):
 
         settings_frame = ttk.LabelFrame(self.main_frame, text="Build Output")
         settings_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
-        for column in range(6):
+        for column in range(8):
             settings_frame.columnconfigure(column, weight=1)
 
         ttk.Label(settings_frame, text="Mod Name").grid(row=0, column=0, sticky="w", padx=6, pady=6)
@@ -339,19 +351,26 @@ class DyingAudioApp(tk.Tk):
             values=("Raw Audio via DLDT", "Existing FSB Files"),
             state="readonly",
         ).grid(row=0, column=5, sticky="ew", padx=6, pady=6)
+        ttk.Label(settings_frame, text="Audio Quality").grid(row=0, column=6, sticky="w", padx=6, pady=6)
+        ttk.Combobox(
+            settings_frame,
+            textvariable=self.audio_quality_var,
+            values=DL1_AUDIO_QUALITY_CHOICES,
+            state="readonly",
+        ).grid(row=0, column=7, sticky="ew", padx=6, pady=6)
 
         ttk.Label(settings_frame, text="Mods Root").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(settings_frame, textvariable=self.mods_root_var).grid(row=1, column=1, columnspan=4, sticky="ew", padx=6, pady=6)
-        ttk.Button(settings_frame, text="Browse", command=self._browse_mods_root).grid(row=1, column=5, sticky="ew", padx=6, pady=6)
+        ttk.Entry(settings_frame, textvariable=self.mods_root_var).grid(row=1, column=1, columnspan=6, sticky="ew", padx=6, pady=6)
+        ttk.Button(settings_frame, text="Browse", command=self._browse_mods_root).grid(row=1, column=7, sticky="ew", padx=6, pady=6)
 
         ttk.Label(settings_frame, text="DLDT Root").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(settings_frame, textvariable=self.dldt_root_var).grid(row=2, column=1, columnspan=4, sticky="ew", padx=6, pady=6)
-        ttk.Button(settings_frame, text="Browse", command=self._browse_dldt_root).grid(row=2, column=5, sticky="ew", padx=6, pady=6)
+        ttk.Entry(settings_frame, textvariable=self.dldt_root_var).grid(row=2, column=1, columnspan=6, sticky="ew", padx=6, pady=6)
+        ttk.Button(settings_frame, text="Browse", command=self._browse_dldt_root).grid(row=2, column=7, sticky="ew", padx=6, pady=6)
 
         ttk.Label(settings_frame, textvariable=self.toolchain_status_var).grid(
             row=3,
             column=0,
-            columnspan=6,
+            columnspan=8,
             sticky="w",
             padx=6,
             pady=(0, 6),
@@ -359,7 +378,7 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(settings_frame, textvariable=self.loaded_csb_var).grid(
             row=4,
             column=0,
-            columnspan=6,
+            columnspan=8,
             sticky="w",
             padx=6,
             pady=(0, 6),
@@ -367,7 +386,7 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(settings_frame, textvariable=self.preview_tools_var).grid(
             row=5,
             column=0,
-            columnspan=6,
+            columnspan=8,
             sticky="w",
             padx=6,
             pady=(0, 6),
@@ -1556,11 +1575,7 @@ class DyingAudioApp(tk.Tk):
         self.status_var.set(f"Replaced '{entry.entry_name}' with new {'audio' if source_kind == 'raw' else 'FSB'}.")
 
     def _suggest_export_audio_name(self, entry: AudioEntry) -> str:
-        if entry.source_mode == "raw":
-            source = entry.resolved_source_path()
-            suffix = source.suffix if source is not None and source.suffix else ".wav"
-            return f"{entry.entry_name}{suffix}"
-        return f"{entry.entry_name}.wav"
+        return f"{entry.entry_name}{audio_quality_output_suffix(self.audio_quality_var.get())}"
 
     def _export_selected_audio(self) -> None:
         if not self._apply_selected_entry():
@@ -1575,7 +1590,7 @@ class DyingAudioApp(tk.Tk):
             title="Export audio",
             defaultextension=Path(self._suggest_export_audio_name(entry)).suffix,
             initialfile=self._suggest_export_audio_name(entry),
-            filetypes=COMMON_AUDIO_FILETYPES + [("WAV files", "*.wav")],
+            filetypes=AUDIO_EXPORT_FILETYPES,
         )
         if not selection:
             return
@@ -1584,16 +1599,16 @@ class DyingAudioApp(tk.Tk):
 
         def worker(progress, log):
             progress(f"Exporting audio for {entry.entry_name}...", 0, 2)
-            if entry.source_mode == "raw":
-                source = entry.resolved_source_path()
-                if source is None or not source.exists():
-                    raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
-                shutil.copyfile(source, destination)
-                progress(f"Copied {destination.name}.", 2, 2)
-                return destination
-            progress(f"Decoding {entry.entry_name} to WAV...", 1, 2)
-            preview_path = self.preview_player._prepare_preview_wav(entry, log)
-            shutil.copyfile(preview_path, destination)
+            source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
+            if source is None or not source.exists():
+                raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
+            progress(f"Converting {entry.entry_name} to {destination.suffix.lower()}...", 1, 2)
+            export_audio_file(
+                source,
+                destination,
+                log=log,
+                audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
+            )
             progress(f"Copied {destination.name}.", 2, 2)
             return destination
 
@@ -1646,39 +1661,18 @@ class DyingAudioApp(tk.Tk):
                 if source is None or not source.exists():
                     raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
                 compile_source = source
-                if source.suffix.lower() not in {".wav", ".ogg"}:
+                if source.suffix.lower() != ".wav":
                     media_tools = discover_media_tools()
-                    if media_tools.ffmpeg_path is None:
-                        raise RuntimeError(
-                            f"FFmpeg is required to convert '{source.suffix or 'unknown'}' files for FSB export."
-                        )
                     compile_source = temp_root / f"{entry.entry_name}.wav"
-                    command = [
-                        str(media_tools.ffmpeg_path),
-                        "-y",
-                        "-loglevel",
-                        "error",
-                        "-i",
-                        str(source),
-                        "-acodec",
-                        "pcm_s16le",
-                        str(compile_source),
-                    ]
-                    log(" ".join(command))
                     progress(f"Converting {source.name} for FSB export...", 1, 3)
-                    result = run_hidden(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-                    if result.stdout.strip():
-                        log(result.stdout.strip())
-                    if result.stderr.strip():
-                        log(result.stderr.strip())
-                    if result.returncode != 0 or not compile_source.exists():
-                        raise RuntimeError(f"Could not convert '{source.name}' for FSB export.")
+                    compile_source = decode_audio_to_wav(source, compile_source, log=log, tools=media_tools)
                 progress(f"Compiling {entry.entry_name} to FSB...", 2, 3)
                 compile_result = compile_audio_to_fsb(
                     self.current_toolchain,
                     compile_source,
                     destination,
                     temp_root / "cache",
+                    audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
                 )
                 log(" ".join(compile_result.command))
                 if compile_result.stdout:
@@ -1915,14 +1909,31 @@ class DyingAudioApp(tk.Tk):
         if not output_dir:
             return
 
-        def worker(progress, _log):
-            extracted = extract_csb(csb_path, output_dir, progress=progress)
+        export_audio = self._ask_yes_no_cancel_window(
+            "Extract CSB",
+            "Export decoded audio instead of FSB files?\n\nYes: export audio files\nNo: export FSB files\nCancel: stop extraction.",
+            kind="info",
+        )
+        if export_audio is None:
+            return
+        output_format = "audio" if export_audio else "fsb"
+
+        def worker(progress, log):
+            extracted = extract_csb(
+                csb_path,
+                output_dir,
+                progress=progress,
+                output_format=output_format,
+                audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
+                log=log,
+            )
             manifest_path = write_manifest(Path(output_dir) / "manifest.generated.json", extracted)
             return extracted, manifest_path
 
         def on_success(result: object) -> None:
             extracted, manifest_path = result
-            self._append_log(f"Extracted {len(extracted)} FSB file(s) to {output_dir}")
+            output_label = "audio file(s)" if output_format == "audio" else "FSB file(s)"
+            self._append_log(f"Extracted {len(extracted)} {output_label} to {output_dir}")
             self._append_log(f"Wrote manifest to {manifest_path}")
             self.task_status_var.set("Extraction complete.")
             self.status_var.set(f"Extracted {Path(csb_path).name}.")
@@ -1981,6 +1992,7 @@ class DyingAudioApp(tk.Tk):
                 builder_mode=self.builder_mode_var.get().strip() or "Raw Audio via DLDT",
                 toolchain=self.current_toolchain,
                 log=log,
+                audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
                 magic=self._effective_output_magic(),
                 progress=progress,
             )
@@ -2033,6 +2045,7 @@ class DyingAudioApp(tk.Tk):
         settings.dl1.mods_root = self.mods_root_var.get().strip()
         settings.dl1.dldt_root = self.dldt_root_var.get().strip()
         settings.dl1.builder_mode = self.builder_mode_var.get().strip() or "Raw Audio via DLDT"
+        settings.dl1.audio_quality = self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY
         settings.dl1.mod_name = self.mod_name_var.get().strip() or DEFAULT_MOD_NAME
         settings.dl1.bundle_name = self.bundle_name_var.get().strip() or DEFAULT_BUNDLE_NAME
         settings.dl1.generate_audiodata = self.generate_script_var.get()
@@ -2085,6 +2098,7 @@ class DyingAudioApp(tk.Tk):
                 builder_mode=self.builder_mode_var.get().strip() or "Raw Audio via DLDT",
                 toolchain=self.current_toolchain,
                 log=log,
+                audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
                 magic=self._effective_output_magic(),
                 progress=progress,
             )
