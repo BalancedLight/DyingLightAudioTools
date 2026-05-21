@@ -27,6 +27,7 @@ class AudioEntry:
     entry_type: int = 2
     sample_count: int = 0
     duration_ms: int = 0
+    speech_intensity: float = 1.0
     reserved: int = 0
     notes: str = ""
 

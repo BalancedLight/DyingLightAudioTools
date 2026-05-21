@@ -29,6 +29,7 @@ def load_manifest(path: str | Path) -> list[AudioEntry]:
                 entry_type=int(item.get("type", 2)),
                 sample_count=int(item.get("sampleCount", 0)),
                 duration_ms=int(item.get("durationMs", 0)),
+                speech_intensity=float(item.get("speechIntensity", 1.0)),
                 reserved=int(item.get("reserved", 0)),
                 notes="Imported from manifest.",
             )
@@ -61,6 +62,7 @@ def write_manifest(path: str | Path, entries: list[AudioEntry]) -> Path:
                 "type": int(entry.entry_type),
                 "sampleCount": int(entry.sample_count),
                 "durationMs": int(entry.duration_ms),
+                "speechIntensity": float(entry.speech_intensity),
                 "reserved": int(entry.reserved),
             }
         )

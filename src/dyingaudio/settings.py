@@ -69,6 +69,7 @@ class DL1Settings:
     localized_bank: bool = False
     generate_spb: bool = False
     speech_text_source: str = ""
+    speech_intensity: float = 1.0
     last_output_folder: str = ""
 
 

@@ -65,9 +65,24 @@ DL1_SOURCE_FILETYPES = [
     COMMON_AUDIO_FILETYPES[-1],
 ]
 
+SPEECH_INTENSITY_MIN = 0.0
+SPEECH_INTENSITY_MAX = 2.0
+DEFAULT_SPEECH_INTENSITY = 1.0
+
 
 def _is_fsb_source(path: str | Path) -> bool:
     return Path(path).suffix.lower() == ".fsb"
+
+
+def _clamp_speech_intensity(value: float) -> float:
+    return max(SPEECH_INTENSITY_MIN, min(SPEECH_INTENSITY_MAX, float(value)))
+
+
+def _format_speech_intensity(value: float) -> str:
+    clamped = _clamp_speech_intensity(value)
+    if clamped.is_integer():
+        return str(int(clamped))
+    return f"{clamped:.2f}".rstrip("0").rstrip(".")
 
 
 class DyingAudioApp(tk.Tk):
@@ -77,7 +92,7 @@ class DyingAudioApp(tk.Tk):
         self._apply_window_icon()
         self._configure_appearance()
         self.geometry("1500x920")
-        self.minsize(1200, 760)
+        self.minsize(1200, 1100)
 
         self.settings = load_settings()
         self.experimental_frame: ExperimentalWwiseFrame | None = None
@@ -103,6 +118,12 @@ class DyingAudioApp(tk.Tk):
         self.localized_bank_var = tk.BooleanVar(value=self.settings.dl1.localized_bank or self.settings.dl1.generate_spb)
         self.generate_spb_var = tk.BooleanVar(value=self.settings.dl1.generate_spb)
         self.speech_text_source_var = tk.StringVar(value=self.settings.dl1.speech_text_source)
+        self.global_speech_intensity_var = tk.StringVar(
+            value=_format_speech_intensity(getattr(self.settings.dl1, "speech_intensity", DEFAULT_SPEECH_INTENSITY))
+        )
+        self.global_speech_intensity_scale_var = tk.DoubleVar(
+            value=_clamp_speech_intensity(getattr(self.settings.dl1, "speech_intensity", DEFAULT_SPEECH_INTENSITY))
+        )
         self.speech_summary_var = tk.StringVar(value="Speech Data: disabled")
         self.status_var = tk.StringVar(value="Ready.")
         self.toolchain_status_var = tk.StringVar(value="")
@@ -133,6 +154,8 @@ class DyingAudioApp(tk.Tk):
         self.selected_type_var = tk.StringVar(value="2")
         self.selected_sample_count_var = tk.StringVar(value="0")
         self.selected_duration_var = tk.StringVar(value="0")
+        self.selected_speech_intensity_var = tk.StringVar(value=_format_speech_intensity(DEFAULT_SPEECH_INTENSITY))
+        self.selected_speech_intensity_scale_var = tk.DoubleVar(value=DEFAULT_SPEECH_INTENSITY)
         self.selected_source_var = tk.StringVar(value="")
         self.selected_fsb_var = tk.StringVar(value="")
         self.selected_notes_var = tk.StringVar(value="")
@@ -167,6 +190,7 @@ class DyingAudioApp(tk.Tk):
             self.localized_bank_var,
             self.generate_spb_var,
             self.speech_text_source_var,
+            self.global_speech_intensity_var,
         ):
             traced_var.trace_add("write", self._on_settings_changed)
         self.entry_search_var.trace_add("write", self._on_entry_filter_changed)
@@ -177,6 +201,7 @@ class DyingAudioApp(tk.Tk):
             self.selected_type_var,
             self.selected_sample_count_var,
             self.selected_duration_var,
+            self.selected_speech_intensity_var,
         ):
             traced_var.trace_add("write", self._on_selected_detail_changed)
 
@@ -413,6 +438,28 @@ class DyingAudioApp(tk.Tk):
             padx=6,
             pady=(0, 6),
         )
+        self.global_speech_intensity_frame = ttk.Frame(settings_frame)
+        self.global_speech_intensity_frame.grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
+        self.global_speech_intensity_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.global_speech_intensity_frame, text="Global Speech Intensity").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self.global_speech_intensity_scale = ttk.Scale(
+            self.global_speech_intensity_frame,
+            from_=SPEECH_INTENSITY_MIN,
+            to=SPEECH_INTENSITY_MAX,
+            variable=self.global_speech_intensity_scale_var,
+            command=self._on_global_speech_intensity_scale_changed,
+        )
+        self.global_speech_intensity_scale.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.global_speech_intensity_entry = ttk.Entry(
+            self.global_speech_intensity_frame,
+            textvariable=self.global_speech_intensity_var,
+            width=8,
+        )
+        self.global_speech_intensity_entry.grid(row=0, column=2, sticky="e")
+        self.global_speech_intensity_entry.bind("<FocusOut>", self._sync_global_speech_intensity_from_entry)
+        self.global_speech_intensity_entry.bind("<Return>", self._sync_global_speech_intensity_from_entry)
         ttk.Label(settings_frame, textvariable=self.toolchain_status_var).grid(
             row=5,
             column=0,
@@ -568,8 +615,28 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(detail_frame, text="Notes").grid(row=7, column=0, sticky="nw", padx=6, pady=6)
         ttk.Label(detail_frame, textvariable=self.selected_notes_var, wraplength=420).grid(row=7, column=1, sticky="w", padx=6, pady=6)
 
+        self.selected_speech_intensity_frame = ttk.Frame(detail_frame)
+        self.selected_speech_intensity_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.selected_speech_intensity_frame, text="Speech Intensity").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.selected_speech_intensity_scale = ttk.Scale(
+            self.selected_speech_intensity_frame,
+            from_=SPEECH_INTENSITY_MIN,
+            to=SPEECH_INTENSITY_MAX,
+            variable=self.selected_speech_intensity_scale_var,
+            command=self._on_selected_speech_intensity_scale_changed,
+        )
+        self.selected_speech_intensity_scale.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.selected_speech_intensity_entry = ttk.Entry(
+            self.selected_speech_intensity_frame,
+            textvariable=self.selected_speech_intensity_var,
+            width=8,
+        )
+        self.selected_speech_intensity_entry.grid(row=0, column=2, sticky="e")
+        self.selected_speech_intensity_entry.bind("<FocusOut>", self._sync_selected_speech_intensity_from_entry)
+        self.selected_speech_intensity_entry.bind("<Return>", self._sync_selected_speech_intensity_from_entry)
+
         preview_frame = ttk.LabelFrame(detail_frame, text="Preview")
-        preview_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
+        preview_frame.grid(row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
         preview_frame.columnconfigure(0, weight=1)
         ttk.Label(preview_frame, textvariable=self.preview_info_var, wraplength=420).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=6, pady=6
@@ -592,7 +659,7 @@ class DyingAudioApp(tk.Tk):
 
         self.apply_entry_button = ttk.Button(detail_frame, text="Apply Entry Changes", command=self._apply_selected_entry)
         self.apply_entry_button.grid(
-            row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8)
+            row=10, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 8)
         )
 
         for widget in (
@@ -600,6 +667,7 @@ class DyingAudioApp(tk.Tk):
             self.selected_type_entry,
             self.selected_sample_count_entry,
             self.selected_duration_entry,
+            self.selected_speech_intensity_entry,
         ):
             widget.bind("<Return>", self._commit_selected_entry_from_focus)
 
@@ -678,6 +746,7 @@ class DyingAudioApp(tk.Tk):
         self.proc_text.edit_modified(False)
 
     def _on_settings_changed(self, *_args: object) -> None:
+        self._update_speech_intensity_controls()
         self._update_toolchain_status()
         self._update_speech_summary()
         self._update_script_preview()
@@ -701,6 +770,8 @@ class DyingAudioApp(tk.Tk):
                 self.selected_type_var.set("2")
                 self.selected_sample_count_var.set("0")
                 self.selected_duration_var.set("0")
+                self.selected_speech_intensity_var.set(_format_speech_intensity(DEFAULT_SPEECH_INTENSITY))
+                self.selected_speech_intensity_scale_var.set(DEFAULT_SPEECH_INTENSITY)
                 self.selected_source_var.set("")
                 self.selected_fsb_var.set("")
                 self.selected_notes_var.set("")
@@ -710,6 +781,8 @@ class DyingAudioApp(tk.Tk):
                 self.selected_type_var.set(str(entry.entry_type))
                 self.selected_sample_count_var.set(str(entry.sample_count))
                 self.selected_duration_var.set(str(entry.duration_ms))
+                self.selected_speech_intensity_var.set(_format_speech_intensity(entry.speech_intensity))
+                self.selected_speech_intensity_scale_var.set(_clamp_speech_intensity(entry.speech_intensity))
                 self.selected_source_var.set(entry.source_path)
                 self.selected_fsb_var.set(entry.fsb_path)
                 self.selected_notes_var.set(entry.notes)
@@ -726,9 +799,62 @@ class DyingAudioApp(tk.Tk):
             self.selected_type_entry,
             self.selected_sample_count_entry,
             self.selected_duration_entry,
+            self.selected_speech_intensity_entry,
         ):
             widget.configure(state=entry_state)
+        self.selected_speech_intensity_scale.configure(state=entry_state)
+        if has_selection and self._speech_controls_enabled():
+            self.selected_speech_intensity_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        else:
+            self.selected_speech_intensity_frame.grid_remove()
         self.apply_entry_button.configure(state="normal" if has_selection and self._detail_form_dirty else "disabled")
+
+    def _speech_controls_enabled(self) -> bool:
+        return self.localized_bank_var.get() or self.generate_spb_var.get()
+
+    def _update_speech_intensity_controls(self) -> None:
+        show_controls = self._speech_controls_enabled()
+        if show_controls:
+            self.global_speech_intensity_frame.grid()
+        else:
+            self.global_speech_intensity_frame.grid_remove()
+        global_state = "normal" if show_controls else "disabled"
+        self.global_speech_intensity_entry.configure(state=global_state)
+        self.global_speech_intensity_scale.configure(state=global_state)
+        self._update_selected_entry_controls()
+
+    def _try_parse_speech_intensity(self, value: str, *, default: float) -> float:
+        try:
+            return _clamp_speech_intensity(float(value.strip() or default))
+        except ValueError:
+            return _clamp_speech_intensity(default)
+
+    def _parse_speech_intensity(self, value: str, *, field_name: str) -> float:
+        try:
+            parsed = float(value.strip() or DEFAULT_SPEECH_INTENSITY)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a number between {SPEECH_INTENSITY_MIN:g} and {SPEECH_INTENSITY_MAX:g}.") from exc
+        if parsed < SPEECH_INTENSITY_MIN or parsed > SPEECH_INTENSITY_MAX:
+            raise ValueError(f"{field_name} must be between {SPEECH_INTENSITY_MIN:g} and {SPEECH_INTENSITY_MAX:g}.")
+        return parsed
+
+    def _on_global_speech_intensity_scale_changed(self, value: str) -> None:
+        self.global_speech_intensity_var.set(_format_speech_intensity(float(value)))
+
+    def _sync_global_speech_intensity_from_entry(self, _event: object | None = None) -> str | None:
+        value = self._try_parse_speech_intensity(self.global_speech_intensity_var.get(), default=DEFAULT_SPEECH_INTENSITY)
+        self.global_speech_intensity_scale_var.set(value)
+        self.global_speech_intensity_var.set(_format_speech_intensity(value))
+        return None
+
+    def _on_selected_speech_intensity_scale_changed(self, value: str) -> None:
+        self.selected_speech_intensity_var.set(_format_speech_intensity(float(value)))
+
+    def _sync_selected_speech_intensity_from_entry(self, _event: object | None = None) -> str | None:
+        value = self._try_parse_speech_intensity(self.selected_speech_intensity_var.get(), default=DEFAULT_SPEECH_INTENSITY)
+        self.selected_speech_intensity_scale_var.set(value)
+        self.selected_speech_intensity_var.set(_format_speech_intensity(value))
+        return None
 
     def _clear_suspended_tree_select(self) -> None:
         self._suspend_tree_select = False
@@ -1015,16 +1141,22 @@ class DyingAudioApp(tk.Tk):
     def _on_generate_spb_toggle(self) -> None:
         if self.generate_spb_var.get() and not self.localized_bank_var.get():
             self.localized_bank_var.set(True)
+        self._update_speech_intensity_controls()
         self._update_speech_summary()
         self._update_script_preview()
 
     def _update_speech_summary(self) -> None:
         text_source = self.speech_text_source_var.get().strip()
+        intensity_label = self.global_speech_intensity_var.get().strip() or _format_speech_intensity(DEFAULT_SPEECH_INTENSITY)
         if self.generate_spb_var.get():
             source_label = text_source or "auto-search data/texts_steam_workshop.scr"
-            self.speech_summary_var.set(f"Speech Data: SPB generation enabled; text source: {source_label}")
+            self.speech_summary_var.set(
+                f"Speech Data: SPB generation enabled; text source: {source_label}; global intensity: {intensity_label}x"
+            )
         elif self.localized_bank_var.get():
-            self.speech_summary_var.set("Speech Data: localized load mode enabled; generated scripts use LoadLocalisedAudioBank.")
+            self.speech_summary_var.set(
+                f"Speech Data: localized load mode enabled; generated scripts use LoadLocalisedAudioBank; global intensity: {intensity_label}x"
+            )
         else:
             self.speech_summary_var.set("Speech Data: disabled")
 
@@ -1034,6 +1166,10 @@ class DyingAudioApp(tk.Tk):
             text_source=text_source or None,
             auto_text_root=auto_text_root,
             log=log,
+            global_intensity=self._try_parse_speech_intensity(
+                self.global_speech_intensity_var.get(),
+                default=getattr(self.settings.dl1, "speech_intensity", DEFAULT_SPEECH_INTENSITY),
+            ),
         )
 
     def _on_proc_text_modified(self, _event: object) -> None:
@@ -1464,10 +1600,14 @@ class DyingAudioApp(tk.Tk):
             entry_type = int(self.selected_type_var.get() or 2)
             sample_count = int(self.selected_sample_count_var.get() or 0)
             duration_ms = int(self.selected_duration_var.get() or 0)
+            speech_intensity = self._parse_speech_intensity(
+                self.selected_speech_intensity_var.get(),
+                field_name="Speech intensity",
+            )
         except ValueError:
             self._show_error_window(
                 "Invalid entry values",
-                "Type, Samples @ 48k, and Duration (ms) must be whole numbers.",
+                "Type, Samples @ 48k, and Duration (ms) must be whole numbers, and speech intensity must be a number from 0 to 2.",
             )
             self.status_var.set("Entry update failed.")
             return False
@@ -1485,6 +1625,7 @@ class DyingAudioApp(tk.Tk):
         entry.entry_type = entry_type
         entry.sample_count = sample_count
         entry.duration_ms = duration_ms
+        entry.speech_intensity = speech_intensity
         self._detail_form_dirty = False
         self._refresh_tree()
         self.status_var.set(f"Updated entry '{entry.entry_name}'.")
@@ -2168,6 +2309,12 @@ class DyingAudioApp(tk.Tk):
         settings.dl1.localized_bank = self.localized_bank_var.get() or self.generate_spb_var.get()
         settings.dl1.generate_spb = self.generate_spb_var.get()
         settings.dl1.speech_text_source = self.speech_text_source_var.get().strip()
+        settings.dl1.speech_intensity = self._try_parse_speech_intensity(
+            self.global_speech_intensity_var.get(),
+            default=getattr(settings.dl1, "speech_intensity", DEFAULT_SPEECH_INTENSITY),
+        )
+        self.global_speech_intensity_var.set(_format_speech_intensity(settings.dl1.speech_intensity))
+        self.global_speech_intensity_scale_var.set(settings.dl1.speech_intensity)
         settings.dl1.last_output_folder = str(self.last_built_mod_root or "")
         if self.experimental_frame is not None:
             settings.experimental = self.experimental_frame.build_settings()

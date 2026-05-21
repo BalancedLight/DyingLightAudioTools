@@ -107,6 +107,7 @@ def _compile_entries(
                 entry_type=entry.entry_type,
                 sample_count=entry.sample_count or metadata.sample_count_48k,
                 duration_ms=entry.duration_ms or metadata.duration_ms,
+                speech_intensity=entry.speech_intensity,
                 reserved=entry.reserved,
                 notes=metadata.notes or "Compiled by DLDT.",
             )
@@ -138,6 +139,7 @@ def _prepare_existing_fsb_entry(entry: AudioEntry) -> AudioEntry:
         entry_type=entry.entry_type,
         sample_count=entry.sample_count,
         duration_ms=entry.duration_ms,
+        speech_intensity=entry.speech_intensity,
         reserved=entry.reserved,
         notes=entry.notes or "Existing FSB file.",
     )

@@ -76,6 +76,7 @@ class SpeechBuildOptions:
     media_tools: MediaTools | None = None
     log: Callable[[str], None] | None = None
     silence_gate: float = 0.08
+    global_intensity: float = 1.0
 
 
 @dataclass(slots=True)
@@ -411,12 +412,17 @@ def _add_pulse(curves: dict[str, list[float]], label: str, frame_index: int, str
             curve[target] = max(curve[target], min(1.0, strength * scale))
 
 
+def _clamp_intensity(value: float) -> float:
+    return max(0.0, min(2.0, float(value)))
+
+
 def _build_speech_entry(
     entry_name: str,
     *,
     text: str | None,
     duration_ms: int,
     envelope: list[float] | None,
+    intensity: float = 1.0,
 ) -> SpeechEntry:
     frame_count = max(1, int(math.ceil((duration_ms / 1000.0) / SPB_FRAME_STEP_SECONDS)))
     if envelope is None:
@@ -426,6 +432,7 @@ def _build_speech_entry(
         if len(shaped_envelope) < frame_count:
             shaped_envelope.extend([0.0] * (frame_count - len(shaped_envelope)))
 
+    intensity = _clamp_intensity(intensity)
     curves = {label: [0.0] * frame_count for label in SPB_TRACK_LABELS}
     tokens = _tokenize_visemes(text or "")
     if not tokens:
@@ -455,7 +462,7 @@ def _build_speech_entry(
 
     tracks: list[SpeechTrack] = []
     for label in SPB_TRACK_LABELS:
-        curve = [_curve_value(value) for value in curves[label]]
+        curve = [_curve_value(min(1.0, value * intensity)) for value in curves[label]]
         if any(curve):
             tracks.append(SpeechTrack(label=label, curve=curve, max_weight=SPB_TRACK_MAX_WEIGHTS[label]))
     return SpeechEntry(name=entry_name, frame_count=frame_count, tracks=tracks)
@@ -527,6 +534,7 @@ def build_spb_file(
                     text=transcript,
                     duration_ms=duration_ms,
                     envelope=envelope,
+                    intensity=options.global_intensity * entry.speech_intensity,
                 )
             )
 
