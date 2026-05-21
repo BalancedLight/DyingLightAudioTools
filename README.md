@@ -10,6 +10,14 @@ Windows-first Python GUI tools for working with Dying Light series audio.
 
 ## First-Time Setup
 
+### Via Releases
+1. Download the executable
+2. Run it!
+
+If you get an alert from Windows Security or another antimalware executable, ignore it. Antimalware engines do not like packed Python executables!
+If you still feel uncomfortable, you can run via Python below.
+
+### Via Python
 1. Install a normal Windows Python build with `tkinter` support. Python from the Microsoft Store alias alone is usually not enough.
 2. Open the app once and let it remember your paths in `settings.json`.
 3. For DL1 raw-audio builds, point `DLDT Root` at the Dying Light Developer Tools folder.
@@ -71,6 +79,13 @@ Replacing or adding raw audio keeps the project in raw-audio mode because DLDT i
 - Vorbis presets rebuild through `.ogg` intermediates and also become the default export format for `Export Audio` and decoded `Extract CSB`
 - `PCM WAV` keeps decoded exports and rebuild intermediates as `.wav` (Very high file sizes!)
 
+### Speech Pattern Bank Creation
+
+You can now generate `.spb` files for use in localized audio banks.
+
+Enable by checking the "Localized Speech Bank" option and "Generate SPB" option. Select your text `.scr` containing your line data for your audio.
+If you're creating a workshop mod, this will almost always be `texts_steam_workshop.scr`.
+
 ### Useful DL1 actions
 
 - `Preview`: play the selected entry directly from the source file or extracted FSB data
@@ -78,6 +93,7 @@ Replacing or adding raw audio keeps the project in raw-audio mode because DLDT i
 - `Extract CSB`: unpack embedded FSBs from an existing bundle, or export decoded audio plus a reusable manifest
 - Right-click an entry for replace, export, duplicate, rename, or remove
 - Search and sort the entry list without losing the original underlying entry indices
+
 
 ## Dying Light 2 / The Beast (Experimental)
 
