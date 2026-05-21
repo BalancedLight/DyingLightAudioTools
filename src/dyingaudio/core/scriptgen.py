@@ -18,12 +18,15 @@ def normalize_proc_names(raw_text: str) -> list[str]:
     return list(ordered.keys())
 
 
-def generate_audiodata_scr(bundle_name: str, raw_proc_text: str) -> str:
+def generate_audiodata_scr(bundle_name: str, raw_proc_text: str, *, load_mode: str = "audio") -> str:
     bank_name = Path(bundle_name.strip()).stem
     if not bank_name:
         raise ValueError("Bundle name is required to generate audiodata.scr.")
+    if load_mode not in {"audio", "localised"}:
+        raise ValueError("load_mode must be 'audio' or 'localised'.")
 
     proc_names = normalize_proc_names(raw_proc_text)
+    loader_name = "LoadLocalisedAudioBank" if load_mode == "localised" else "LoadAudioBanks"
     lines = [
         '!include("AudioScript.def")',
         "",
@@ -37,7 +40,7 @@ def generate_audiodata_scr(bundle_name: str, raw_proc_text: str) -> str:
             [
                 f'AudioProc("{proc_name}")',
                 "{",
-                f'    LoadAudioBanks("{bank_name}")',
+                f'    {loader_name}("{bank_name}")',
                 "}",
                 "",
             ]

@@ -89,6 +89,24 @@ class BackgroundTaskRunner:
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
 
+        def invoke_callback(callback: Callable[..., object] | None, *args: object, report_errors: bool = True) -> None:
+            if callback is None:
+                return
+            try:
+                callback(*args)
+            except BaseException as exc:
+                if not report_errors:
+                    traceback.print_exc()
+                    return
+                details = traceback.format_exc()
+                if on_error is not None and callback is not on_error:
+                    try:
+                        on_error(exc, details)
+                    except BaseException:
+                        traceback.print_exc()
+                else:
+                    traceback.print_exc()
+
         def poll() -> None:
             self._after_id = None
             should_continue = self._running
@@ -98,21 +116,20 @@ class BackgroundTaskRunner:
                 except queue.Empty:
                     break
 
-                if event == "progress" and on_progress is not None:
-                    on_progress(payload if isinstance(payload, TaskProgress) else TaskProgress())
-                elif event == "log" and on_log is not None and isinstance(payload, str):
-                    on_log(payload)
-                elif event == "success" and on_success is not None:
-                    on_success(payload)
-                elif event == "error" and on_error is not None and isinstance(payload, tuple):
+                if event == "progress":
+                    invoke_callback(on_progress, payload if isinstance(payload, TaskProgress) else TaskProgress())
+                elif event == "log" and isinstance(payload, str):
+                    invoke_callback(on_log, payload)
+                elif event == "success":
+                    invoke_callback(on_success, payload)
+                elif event == "error" and isinstance(payload, tuple):
                     exc, details = payload
                     if isinstance(exc, BaseException) and isinstance(details, str):
-                        on_error(exc, details)
+                        invoke_callback(on_error, exc, details, report_errors=False)
                 elif event == "finally":
                     self._running = False
                     should_continue = False
-                    if on_finally is not None:
-                        on_finally()
+                    invoke_callback(on_finally)
 
             if should_continue:
                 try:

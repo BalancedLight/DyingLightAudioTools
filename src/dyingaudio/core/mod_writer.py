@@ -11,6 +11,7 @@ from dyingaudio.core.csb import WORKSHOP_MAGIC, pack_csb
 from dyingaudio.core.dldt import DldtToolchain, compile_audio_to_fsb
 from dyingaudio.core.media_tools import prepare_audio_for_fsb
 from dyingaudio.core.scriptgen import generate_audiodata_scr
+from dyingaudio.core.spb import SpeechBuildOptions, SpeechBuildResult, build_spb_file
 from dyingaudio.models import AudioEntry
 
 
@@ -21,12 +22,16 @@ class BuildArtifacts:
     modinfo_path: Path
     script_path: Path | None
     built_entries: list[AudioEntry]
+    spb_path: Path | None = None
+    speech_result: SpeechBuildResult | None = None
 
 
 @dataclass(slots=True)
 class CsbBuildArtifacts:
     csb_path: Path
     built_entries: list[AudioEntry]
+    spb_path: Path | None = None
+    speech_result: SpeechBuildResult | None = None
 
 
 def _write_modinfo(path: Path) -> None:
@@ -194,6 +199,9 @@ def build_mod(
     log: Callable[[str], None],
     audio_quality: str = "Vorbis q10",
     magic: int | None = WORKSHOP_MAGIC,
+    localized_bank: bool = False,
+    generate_spb: bool = False,
+    speech_options: SpeechBuildOptions | None = None,
     progress: Callable[[str, float | None, float | None], None] | None = None,
 ) -> BuildArtifacts:
     resolved_mods_root = Path(mods_root).expanduser().resolve()
@@ -218,6 +226,8 @@ def build_mod(
         toolchain=toolchain,
         log=log,
         magic=magic,
+        generate_spb=generate_spb,
+        speech_options=speech_options,
         progress=progress,
     )
 
@@ -228,7 +238,8 @@ def build_mod(
     if generate_script:
         script_root.mkdir(parents=True, exist_ok=True)
         script_path = script_root / "audiodata.scr"
-        script_path.write_text(generate_audiodata_scr(bundle_name, proc_names_text), encoding="utf-8")
+        load_mode = "localised" if localized_bank or generate_spb else "audio"
+        script_path.write_text(generate_audiodata_scr(bundle_name, proc_names_text, load_mode=load_mode), encoding="utf-8")
 
     return BuildArtifacts(
         mod_root=mod_root,
@@ -236,6 +247,8 @@ def build_mod(
         modinfo_path=modinfo_path,
         script_path=script_path,
         built_entries=csb_result.built_entries,
+        spb_path=csb_result.spb_path,
+        speech_result=csb_result.speech_result,
     )
 
 
@@ -248,6 +261,8 @@ def build_csb_file(
     log: Callable[[str], None],
     audio_quality: str = "Vorbis q10",
     magic: int | None = WORKSHOP_MAGIC,
+    generate_spb: bool = False,
+    speech_options: SpeechBuildOptions | None = None,
     progress: Callable[[str, float | None, float | None], None] | None = None,
 ) -> CsbBuildArtifacts:
     destination = Path(output_path).expanduser().resolve()
@@ -266,5 +281,20 @@ def build_csb_file(
             progress=progress,
         )
         pack_csb(prepared_entries, destination, magic=magic, progress=progress)
+        speech_result: SpeechBuildResult | None = None
+        spb_path: Path | None = None
+        if generate_spb:
+            options = speech_options or SpeechBuildOptions()
+            if options.log is None:
+                options.log = log
+            if options.auto_text_root is None:
+                options.auto_text_root = destination.parent
+            speech_result = build_spb_file(
+                prepared_entries,
+                destination.with_suffix(".spb"),
+                options=options,
+                progress=progress,
+            )
+            spb_path = speech_result.spb_path
 
-    return CsbBuildArtifacts(csb_path=destination, built_entries=prepared_entries)
+    return CsbBuildArtifacts(csb_path=destination, built_entries=prepared_entries, spb_path=spb_path, speech_result=speech_result)

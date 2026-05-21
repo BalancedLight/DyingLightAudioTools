@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
+from typing import Callable
 
 from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.background import BackgroundTaskRunner, TaskProgress
@@ -30,6 +31,7 @@ from dyingaudio.core.media_tools import (
 from dyingaudio.core.mod_writer import build_csb_file, build_mod
 from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
+from dyingaudio.core.spb import SpeechBuildOptions
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
 from dyingaudio.models import AudioEntry, entry_type_from_channel_count, format_entry_type
 from dyingaudio.other_workspace import OtherWorkspaceFrame
@@ -98,6 +100,10 @@ class DyingAudioApp(tk.Tk):
         self.builder_mode_var = tk.StringVar(value=self.settings.builder_mode or "Raw Audio via DLDT")
         self.audio_quality_var = tk.StringVar(value=self.settings.audio_quality or DEFAULT_DL1_AUDIO_QUALITY)
         self.generate_script_var = tk.BooleanVar(value=self.settings.generate_audiodata)
+        self.localized_bank_var = tk.BooleanVar(value=self.settings.dl1.localized_bank or self.settings.dl1.generate_spb)
+        self.generate_spb_var = tk.BooleanVar(value=self.settings.dl1.generate_spb)
+        self.speech_text_source_var = tk.StringVar(value=self.settings.dl1.speech_text_source)
+        self.speech_summary_var = tk.StringVar(value="Speech Data: disabled")
         self.status_var = tk.StringVar(value="Ready.")
         self.toolchain_status_var = tk.StringVar(value="")
         self.loaded_csb_var = tk.StringVar(value="Loaded CSB: none")
@@ -148,6 +154,7 @@ class DyingAudioApp(tk.Tk):
         self._update_sort_controls()
         self._refresh_tree()
         self._update_toolchain_status()
+        self._update_speech_summary()
         self._update_script_preview()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -157,6 +164,9 @@ class DyingAudioApp(tk.Tk):
             self.dldt_root_var,
             self.builder_mode_var,
             self.audio_quality_var,
+            self.localized_bank_var,
+            self.generate_spb_var,
+            self.speech_text_source_var,
         ):
             traced_var.trace_add("write", self._on_settings_changed)
         self.entry_search_var.trace_add("write", self._on_entry_filter_changed)
@@ -367,15 +377,35 @@ class DyingAudioApp(tk.Tk):
         ttk.Entry(settings_frame, textvariable=self.dldt_root_var).grid(row=2, column=1, columnspan=6, sticky="ew", padx=6, pady=6)
         ttk.Button(settings_frame, text="Browse", command=self._browse_dldt_root).grid(row=2, column=7, sticky="ew", padx=6, pady=6)
 
-        ttk.Label(settings_frame, textvariable=self.toolchain_status_var).grid(
+        ttk.Checkbutton(
+            settings_frame,
+            text="Localized speech bank",
+            variable=self.localized_bank_var,
+            command=self._update_script_preview,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=6)
+        ttk.Checkbutton(
+            settings_frame,
+            text="Generate SPB",
+            variable=self.generate_spb_var,
+            command=self._on_generate_spb_toggle,
+        ).grid(row=3, column=2, sticky="w", padx=6, pady=6)
+        ttk.Label(settings_frame, text="Text Source").grid(row=3, column=3, sticky="w", padx=6, pady=6)
+        ttk.Entry(settings_frame, textvariable=self.speech_text_source_var).grid(
             row=3,
-            column=0,
-            columnspan=8,
-            sticky="w",
+            column=4,
+            columnspan=3,
+            sticky="ew",
             padx=6,
-            pady=(0, 6),
+            pady=6,
         )
-        ttk.Label(settings_frame, textvariable=self.loaded_csb_var).grid(
+        ttk.Button(settings_frame, text="Browse", command=self._browse_speech_text_source).grid(
+            row=3,
+            column=7,
+            sticky="ew",
+            padx=6,
+            pady=6,
+        )
+        ttk.Label(settings_frame, textvariable=self.speech_summary_var).grid(
             row=4,
             column=0,
             columnspan=8,
@@ -383,8 +413,24 @@ class DyingAudioApp(tk.Tk):
             padx=6,
             pady=(0, 6),
         )
-        ttk.Label(settings_frame, textvariable=self.preview_tools_var).grid(
+        ttk.Label(settings_frame, textvariable=self.toolchain_status_var).grid(
             row=5,
+            column=0,
+            columnspan=8,
+            sticky="w",
+            padx=6,
+            pady=(0, 6),
+        )
+        ttk.Label(settings_frame, textvariable=self.loaded_csb_var).grid(
+            row=6,
+            column=0,
+            columnspan=8,
+            sticky="w",
+            padx=6,
+            pady=(0, 6),
+        )
+        ttk.Label(settings_frame, textvariable=self.preview_tools_var).grid(
+            row=7,
             column=0,
             columnspan=8,
             sticky="w",
@@ -633,6 +679,7 @@ class DyingAudioApp(tk.Tk):
 
     def _on_settings_changed(self, *_args: object) -> None:
         self._update_toolchain_status()
+        self._update_speech_summary()
         self._update_script_preview()
 
     def _on_entry_filter_changed(self, *_args: object) -> None:
@@ -962,6 +1009,33 @@ class DyingAudioApp(tk.Tk):
         else:
             self.toolchain_status_var.set("DLDT toolchain not ready: " + "; ".join(errors))
 
+    def _speech_load_mode(self) -> str:
+        return "localised" if self.localized_bank_var.get() or self.generate_spb_var.get() else "audio"
+
+    def _on_generate_spb_toggle(self) -> None:
+        if self.generate_spb_var.get() and not self.localized_bank_var.get():
+            self.localized_bank_var.set(True)
+        self._update_speech_summary()
+        self._update_script_preview()
+
+    def _update_speech_summary(self) -> None:
+        text_source = self.speech_text_source_var.get().strip()
+        if self.generate_spb_var.get():
+            source_label = text_source or "auto-search data/texts_steam_workshop.scr"
+            self.speech_summary_var.set(f"Speech Data: SPB generation enabled; text source: {source_label}")
+        elif self.localized_bank_var.get():
+            self.speech_summary_var.set("Speech Data: localized load mode enabled; generated scripts use LoadLocalisedAudioBank.")
+        else:
+            self.speech_summary_var.set("Speech Data: disabled")
+
+    def _speech_options(self, *, auto_text_root: str | Path, log: Callable[[str], None] | None = None) -> SpeechBuildOptions:
+        text_source = self.speech_text_source_var.get().strip()
+        return SpeechBuildOptions(
+            text_source=text_source or None,
+            auto_text_root=auto_text_root,
+            log=log,
+        )
+
     def _on_proc_text_modified(self, _event: object) -> None:
         if self.proc_text.edit_modified():
             self.proc_text.edit_modified(False)
@@ -979,7 +1053,11 @@ class DyingAudioApp(tk.Tk):
             return
 
         try:
-            preview = generate_audiodata_scr(self.bundle_name_var.get().strip(), self.proc_text.get("1.0", tk.END))
+            preview = generate_audiodata_scr(
+                self.bundle_name_var.get().strip(),
+                self.proc_text.get("1.0", tk.END),
+                load_mode=self._speech_load_mode(),
+            )
         except ValueError:
             preview = "// Enter a bundle name to preview audiodata.scr.\n"
         self._set_preview_text(preview)
@@ -1122,6 +1200,11 @@ class DyingAudioApp(tk.Tk):
         if index < 0 or index >= len(self.entries):
             return
         iid = str(index)
+        if iid not in self.tree.get_children():
+            visible_indices = self._visible_entry_indices()
+            if not visible_indices:
+                return
+            iid = str(visible_indices[0])
         self.tree.selection_set(iid)
         self.tree.focus(iid)
         self.tree.see(iid)
@@ -1214,6 +1297,27 @@ class DyingAudioApp(tk.Tk):
                 selection = Path(chosen).resolve()
         if selection is not None:
             self.dldt_root_var.set(str(selection))
+            self._save_settings()
+
+    def _browse_speech_text_source(self) -> None:
+        current = self.speech_text_source_var.get().strip()
+        initialdir = None
+        if current:
+            candidate = Path(current).expanduser()
+            initialdir = str(candidate.parent if candidate.is_file() else candidate)
+        selection = filedialog.askopenfilename(
+            title="Select localized text source",
+            initialdir=initialdir,
+            filetypes=[
+                ("Localized text sources", "*.scr *.bin *.tsv *.txt *.csv"),
+                ("Script files", "*.scr"),
+                ("Binary text files", "*.bin"),
+                ("Tab-separated values", "*.tsv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selection:
+            self.speech_text_source_var.set(str(Path(selection).resolve()))
             self._save_settings()
 
     def _refresh_tree(self) -> None:
@@ -1994,6 +2098,8 @@ class DyingAudioApp(tk.Tk):
                 log=log,
                 audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
                 magic=self._effective_output_magic(),
+                generate_spb=self.generate_spb_var.get(),
+                speech_options=self._speech_options(auto_text_root=target_path.parent, log=log),
                 progress=progress,
             )
 
@@ -2004,7 +2110,16 @@ class DyingAudioApp(tk.Tk):
             self.task_status_var.set("Save complete.")
             self.status_var.set(f"Saved {csb_result.csb_path.name}.")
             self._append_log(f"Saved CSB file: {csb_result.csb_path}")
-            self._show_info_window("Save complete", f"Saved CSB file:\n{csb_result.csb_path}")
+            message = f"Saved CSB file:\n{csb_result.csb_path}"
+            if csb_result.spb_path is not None:
+                self._append_log(f"Saved SPB file: {csb_result.spb_path}")
+                message += f"\n\nSaved SPB file:\n{csb_result.spb_path}"
+            if csb_result.speech_result is not None:
+                self.speech_summary_var.set(csb_result.speech_result.summary())
+                self._append_log(csb_result.speech_result.summary())
+            if self.localized_bank_var.get() or self.generate_spb_var.get():
+                message += f'\n\nLoad this bank with LoadLocalisedAudioBank("{csb_result.csb_path.stem}") in audiodata.scr.'
+            self._show_info_window("Save complete", message)
 
         self._run_dl1_task(
             start_message=f"Saving {target_path.name}...",
@@ -2050,6 +2165,9 @@ class DyingAudioApp(tk.Tk):
         settings.dl1.bundle_name = self.bundle_name_var.get().strip() or DEFAULT_BUNDLE_NAME
         settings.dl1.generate_audiodata = self.generate_script_var.get()
         settings.dl1.audio_proc_names = [line.strip() for line in self.proc_text.get("1.0", tk.END).splitlines() if line.strip()]
+        settings.dl1.localized_bank = self.localized_bank_var.get() or self.generate_spb_var.get()
+        settings.dl1.generate_spb = self.generate_spb_var.get()
+        settings.dl1.speech_text_source = self.speech_text_source_var.get().strip()
         settings.dl1.last_output_folder = str(self.last_built_mod_root or "")
         if self.experimental_frame is not None:
             settings.experimental = self.experimental_frame.build_settings()
@@ -2100,6 +2218,12 @@ class DyingAudioApp(tk.Tk):
                 log=log,
                 audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
                 magic=self._effective_output_magic(),
+                localized_bank=self.localized_bank_var.get() or self.generate_spb_var.get(),
+                generate_spb=self.generate_spb_var.get(),
+                speech_options=self._speech_options(
+                    auto_text_root=mods_root / (self.mod_name_var.get().strip() or DEFAULT_MOD_NAME),
+                    log=log,
+                ),
                 progress=progress,
             )
 
@@ -2110,9 +2234,17 @@ class DyingAudioApp(tk.Tk):
             self.status_var.set(f"Built {artifacts.csb_path.name} in {artifacts.mod_root.name}.")
             self._append_log(f"Build complete: {artifacts.csb_path}")
             self._append_log(f"modinfo.ini: {artifacts.modinfo_path}")
+            if artifacts.spb_path is not None:
+                self._append_log(f"SPB file: {artifacts.spb_path}")
+            if artifacts.speech_result is not None:
+                self.speech_summary_var.set(artifacts.speech_result.summary())
+                self._append_log(artifacts.speech_result.summary())
             if artifacts.script_path is not None:
                 self._append_log(f"audiodata.scr: {artifacts.script_path}")
-            self._show_info_window("Build complete", f"Built mod folder:\n{artifacts.mod_root}")
+            message = f"Built mod folder:\n{artifacts.mod_root}"
+            if (self.localized_bank_var.get() or self.generate_spb_var.get()) and artifacts.script_path is None:
+                message += f'\n\nLoad this bank with LoadLocalisedAudioBank("{artifacts.csb_path.stem}") in audiodata.scr.'
+            self._show_info_window("Build complete", message)
 
         self._run_dl1_task(
             start_message=f"Building mod '{self.mod_name_var.get().strip() or DEFAULT_MOD_NAME}'...",

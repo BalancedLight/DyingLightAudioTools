@@ -66,6 +66,9 @@ class DL1Settings:
     bundle_name: str = DEFAULT_BUNDLE_NAME
     generate_audiodata: bool = True
     audio_proc_names: list[str] = field(default_factory=lambda: list(DEFAULT_AUDIO_PROCS))
+    localized_bank: bool = False
+    generate_spb: bool = False
+    speech_text_source: str = ""
     last_output_folder: str = ""
 
 
@@ -269,6 +272,9 @@ def _migrate_legacy_settings(payload: dict[str, Any]) -> AppSettings:
         "bundle_name": payload.get("bundle_name", settings.dl1.bundle_name),
         "generate_audiodata": payload.get("generate_audiodata", settings.dl1.generate_audiodata),
         "audio_proc_names": payload.get("audio_proc_names", list(settings.dl1.audio_proc_names)),
+        "localized_bank": payload.get("localized_bank", settings.dl1.localized_bank),
+        "generate_spb": payload.get("generate_spb", settings.dl1.generate_spb),
+        "speech_text_source": payload.get("speech_text_source", settings.dl1.speech_text_source),
         "last_output_folder": payload.get("last_output_folder", settings.dl1.last_output_folder),
     }
     settings.dl1 = _update_dataclass(settings.dl1, legacy_dl1_payload)
