@@ -8,9 +8,12 @@ import tempfile
 from html import escape
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from dyingaudio.settings import bundled_resource_root
+
+if TYPE_CHECKING:
+    from dyingaudio.settings import ToolSettings
 
 
 COMMON_AUDIO_FILETYPES = [
@@ -50,8 +53,10 @@ def popen_hidden(command: list[str], **kwargs: Any) -> subprocess.Popen[Any]:
     return subprocess.Popen(command, **_hide_console_kwargs(kwargs))
 
 
-def find_tool(executable: str, fallback_paths: list[Path]) -> Path | None:
+def find_tool(executable: str, fallback_paths: list[Path | None]) -> Path | None:
     for fallback in fallback_paths:
+        if fallback is None:
+            continue
         if fallback.exists():
             return fallback
 
@@ -59,6 +64,60 @@ def find_tool(executable: str, fallback_paths: list[Path]) -> Path | None:
     if found:
         return Path(found)
 
+    return None
+
+
+def _existing_executable(path: Path) -> Path | None:
+    try:
+        candidate = path.expanduser()
+    except RuntimeError:
+        return None
+    if candidate.exists() and candidate.is_file():
+        return candidate.resolve()
+    return None
+
+
+def _tool_from_configured_root(root: str, executable: str, relative_paths: tuple[str, ...] = ()) -> Path | None:
+    if not root.strip():
+        return None
+    root_path = Path(root).expanduser()
+    direct = _existing_executable(root_path)
+    if direct is not None and direct.name.lower() == executable.lower():
+        return direct
+    candidates = [
+        root_path / executable,
+        root_path / "bin" / executable,
+        *(root_path / relative_path for relative_path in relative_paths),
+    ]
+    for candidate in candidates:
+        existing = _existing_executable(candidate)
+        if existing is not None:
+            return existing
+    return None
+
+
+def _configured_wwise_console(root: str) -> Path | None:
+    configured = _tool_from_configured_root(
+        root,
+        "WwiseConsole.exe",
+        (
+            r"Authoring\x64\Release\bin\WwiseConsole.exe",
+            r"Authoring\Win32\Release\bin\WwiseConsole.exe",
+        ),
+    )
+    if configured is not None and _is_valid_wwise_console(configured):
+        return configured
+    if not root.strip():
+        return None
+    root_path = Path(root).expanduser()
+    if not root_path.exists() or not root_path.is_dir():
+        return None
+    candidates: list[Path] = []
+    candidates.extend(root_path.glob(r"Wwise*\Authoring\x64\Release\bin\WwiseConsole.exe"))
+    candidates.extend(root_path.glob(r"Wwise*\Authoring\Win32\Release\bin\WwiseConsole.exe"))
+    for candidate in sorted({path.resolve() for path in candidates}, key=lambda path: str(path).lower(), reverse=True):
+        if _is_valid_wwise_console(candidate):
+            return candidate
     return None
 
 
@@ -142,11 +201,24 @@ def _discover_wwise_console() -> Path | None:
     return None
 
 
-def discover_media_tools() -> MediaTools:
+def _load_configured_tools() -> "ToolSettings | None":
+    try:
+        from dyingaudio.settings import load_settings
+    except ImportError:
+        return None
+    return load_settings().tools
+
+
+def discover_media_tools(tool_settings: "ToolSettings | None" = None) -> MediaTools:
+    tool_settings = tool_settings or _load_configured_tools()
     local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+    configured_ffmpeg = tool_settings.ffmpeg_root if tool_settings is not None else ""
+    configured_vgmstream = tool_settings.vgmstream_root if tool_settings is not None else ""
+    configured_wwise = tool_settings.wwise_root if tool_settings is not None else ""
     ffmpeg_path = find_tool(
         "ffmpeg.exe",
         [
+            *([_tool_from_configured_root(configured_ffmpeg, "ffmpeg.exe")] if configured_ffmpeg else []),
             *_portable_tool_candidates(r"ffmpeg\ffmpeg.exe", r"ffmpeg\bin\ffmpeg.exe"),
             Path(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"),
         ],
@@ -154,6 +226,7 @@ def discover_media_tools() -> MediaTools:
     ffplay_path = find_tool(
         "ffplay.exe",
         [
+            *([_tool_from_configured_root(configured_ffmpeg, "ffplay.exe")] if configured_ffmpeg else []),
             *_portable_tool_candidates(r"ffmpeg\ffplay.exe", r"ffmpeg\bin\ffplay.exe"),
             Path(r"C:\ProgramData\chocolatey\bin\ffplay.exe"),
         ],
@@ -161,6 +234,7 @@ def discover_media_tools() -> MediaTools:
     ffprobe_path = find_tool(
         "ffprobe.exe",
         [
+            *([_tool_from_configured_root(configured_ffmpeg, "ffprobe.exe")] if configured_ffmpeg else []),
             *_portable_tool_candidates(r"ffmpeg\ffprobe.exe", r"ffmpeg\bin\ffprobe.exe"),
             Path(r"C:\ProgramData\chocolatey\bin\ffprobe.exe"),
         ],
@@ -168,6 +242,7 @@ def discover_media_tools() -> MediaTools:
     vgmstream_path = find_tool(
         "vgmstream-cli.exe",
         [
+            *([_tool_from_configured_root(configured_vgmstream, "vgmstream-cli.exe")] if configured_vgmstream else []),
             *_portable_tool_candidates(r"vgmstream\vgmstream-cli.exe", r"vgmstream-cli.exe"),
             local_app_data
             / "Microsoft"
@@ -177,7 +252,7 @@ def discover_media_tools() -> MediaTools:
             / "vgmstream-cli.exe",
         ],
     )
-    wwise_console_path = _discover_wwise_console()
+    wwise_console_path = _configured_wwise_console(configured_wwise) or _discover_wwise_console()
     return MediaTools(
         ffmpeg_path=ffmpeg_path,
         ffplay_path=ffplay_path,

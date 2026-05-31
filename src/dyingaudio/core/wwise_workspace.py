@@ -461,8 +461,9 @@ def build_or_load_workspace(
         _raise_if_cancelled(cancel_event)
 
         tools = discover_media_tools()
-        if tools.vgmstream_path is None:
+        if tools.vgmstream_path is None and builder is None:
             raise RuntimeError("vgmstream is required to build the experimental Wwise workspace.")
+        vgmstream_cli_path = tools.vgmstream_path or Path("vgmstream-cli.exe")
         if progress is not None:
             progress("Generating named audio tree in Python...", 2, 5)
         if builder is None:
@@ -476,7 +477,7 @@ def build_or_load_workspace(
                 xml_file=mapping_xml_path,
                 tree_root=tree_root,
                 banks_root=banks_root,
-                vgmstream_cli_path=tools.vgmstream_path,
+                vgmstream_cli_path=vgmstream_cli_path,
                 log=log,
                 progress=progress,
                 cancel_event=cancel_event,
@@ -490,7 +491,7 @@ def build_or_load_workspace(
                 xml_file=mapping_xml_path,
                 tree_root=tree_root,
                 banks_root=banks_root,
-                vgmstream_cli_path=tools.vgmstream_path,
+                vgmstream_cli_path=vgmstream_cli_path,
                 log=log,
                 progress=progress,
             )

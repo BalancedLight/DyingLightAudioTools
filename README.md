@@ -5,7 +5,7 @@ Windows-first Python GUI tools for working with Dying Light series audio.
 ## Current Workspaces
 
 - `Dying Light 1`: edit `.csb` bundles, mix raw audio and existing `.fsb` files, preview entries, save rebuilt banks, and build mods
-- `Dying Light 2 / The Beast (Experimental)`: read-only Wwise browser for named trees, preview, and export
+- `Dying Light 2 / The Beast`: Wwise browser for named trees, preview, export, and experimental replacement
 - `Other`: read-only AKPK / `.pck` browser with preview, export, and experimental replacement tools
 
 ## First-Time Setup
@@ -20,8 +20,8 @@ If you still feel uncomfortable, you can run via Python below.
 ### Via Python
 1. Install a normal Windows Python build with `tkinter` support. Python from the Microsoft Store alias alone is usually not enough.
 2. Open the app once and let it remember your paths in `settings.json`.
-3. For DL1 raw-audio builds, point `DLDT Root` at the Dying Light Developer Tools folder.
-4. For DL1 mod output, point `Mods Root` at your Dying Light `Mods` folder.
+3. Use `Settings > Folders and Tools` to point DyingAudio at DLDT, game roots, caches, FFmpeg, vgmstream, and Wwise.
+4. The welcome menu can check those requirements on startup and can be reopened from `Settings > Open Welcome Menu`.
 
 You can run from source with:
 
@@ -50,11 +50,11 @@ You may also need to install ffmpeg.
 3. Pick raw audio files, `.fsb` files, or a mix of both in the same browse dialog.
 4. Select an entry in the list to review it in `Selected Entry`.
 5. Click `Apply Entry Changes` after editing any fields.
-6. Use `Save CSB File` to write a standalone bank, or `Build Mod` to create a mod folder.
+6. Use `File > Save CSB File` to write a standalone bank.
 
 ### Edit an existing `.csb`
 
-1. Click `Open CSB For Edit`.
+1. Choose `File > Open CSB For Edit`.
 2. Select the entry you want to change.
 3. Click `Replace Audio / FSB`.
 4. Choose a raw audio file such as `.mp3`, `.ogg`, or `.wav`, or pick an `.fsb`.
@@ -89,13 +89,15 @@ If you're creating a workshop mod, this will almost always be `texts_steam_works
 ### Useful DL1 actions
 
 - `Preview`: play the selected entry directly from the source file or extracted FSB data
-- `Inspect CSB`: view entry names, channel info, duration, samples, and notes without opening for edit
-- `Extract CSB`: unpack embedded FSBs from an existing bundle, or export decoded audio plus a reusable manifest
+- `File > Inspect CSB`: view entry names, channel info, duration, samples, and notes without opening for edit
+- `File > Extract CSB`: unpack embedded FSBs from an existing bundle, or export decoded audio plus a reusable manifest
 - Right-click an entry for replace, export, duplicate, rename, or remove
 - Search and sort the entry list without losing the original underlying entry indices
+- `Help > Tool Status` shows playback and editing tool readiness, with missing tools highlighted in red
+- `Tabs > Open Console` reopens the DL1 console after it has been closed
 
 
-## Dying Light 2 / The Beast (Experimental)
+## Dying Light 2 / The Beast
 
 This workspace supports browsing and replacing Wwise audio in DL2 and DLTB AESP archives.
 

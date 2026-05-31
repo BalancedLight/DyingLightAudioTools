@@ -14,7 +14,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from dyingaudio.audio_info import probe_audio_metadata
-from dyingaudio.background import BackgroundTaskRunner, TaskProgress
+from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
 from dyingaudio.core.csb import WORKSHOP_MAGIC, extract_csb, parse_csb
 from dyingaudio.core.dldt import DldtToolchain, compile_audio_to_fsb, discover_toolchain
 from dyingaudio.core.manifest import load_manifest, write_manifest
@@ -33,6 +33,7 @@ from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.core.spb import SpeechBuildOptions
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
+from dyingaudio.core.wwise_workspace import DL2_GAME, DLTB_GAME
 from dyingaudio.models import AudioEntry, entry_type_from_channel_count, format_entry_type
 from dyingaudio.other_workspace import OtherWorkspaceFrame
 from dyingaudio.popups import (
@@ -48,13 +49,24 @@ from dyingaudio.settings import (
     DEFAULT_AUDIO_PROCS,
     DEFAULT_BUNDLE_NAME,
     DEFAULT_DL1_AUDIO_QUALITY,
+    DEFAULT_EXPERIMENTAL_CACHE_ROOT,
     DEFAULT_MOD_NAME,
+    DEFAULT_OTHER_CACHE_ROOT,
+    ToolSettings,
     bundled_resource_root,
     discover_dldt_root,
+    discover_game_root,
     discover_mods_root,
     is_windows_dark_mode,
     load_settings,
     save_settings,
+)
+from dyingaudio.ui_theme import (
+    configure_dark_checkbutton_style,
+    configure_high_contrast_checkbutton_style,
+    dark_palette,
+    high_contrast_palette,
+    style_scrolled_text,
 )
 
 
@@ -105,6 +117,7 @@ class DyingAudioApp(tk.Tk):
         self.loaded_csb_layout: str | None = None
         self.edit_session_dir: tempfile.TemporaryDirectory[str] | None = None
         self.preview_player = PreviewPlayer()
+        self.preview_player.environment = discover_media_tools(self.settings.tools)
         self.task_runner = BackgroundTaskRunner(self)
         self._dark_theme_colors: dict[str, str] | None = None
 
@@ -112,6 +125,16 @@ class DyingAudioApp(tk.Tk):
         self.bundle_name_var = tk.StringVar(value=self.settings.bundle_name or DEFAULT_BUNDLE_NAME)
         self.mods_root_var = tk.StringVar(value=self.settings.mods_root)
         self.dldt_root_var = tk.StringVar(value=self.settings.dldt_root)
+        self.dl2_root_var = tk.StringVar(value=self.settings.experimental.dl2_root)
+        self.dltb_root_var = tk.StringVar(value=self.settings.experimental.dltb_root)
+        self.other_root_var = tk.StringVar(value=self.settings.other.root)
+        self.experimental_cache_root_var = tk.StringVar(value=self.settings.experimental.cache_root)
+        self.other_cache_root_var = tk.StringVar(value=self.settings.other.cache_root)
+        self.ffmpeg_root_var = tk.StringVar(value=self.settings.tools.ffmpeg_root)
+        self.vgmstream_root_var = tk.StringVar(value=self.settings.tools.vgmstream_root)
+        self.wwise_root_var = tk.StringVar(value=self.settings.tools.wwise_root)
+        self.show_welcome_on_startup_var = tk.BooleanVar(value=self.settings.tools.show_welcome_on_startup)
+        self.high_contrast_var = tk.BooleanVar(value=getattr(self.settings.tools, "high_contrast_mode", False))
         self.builder_mode_var = tk.StringVar(value=self.settings.builder_mode or "Raw Audio via DLDT")
         self.audio_quality_var = tk.StringVar(value=self.settings.audio_quality or DEFAULT_DL1_AUDIO_QUALITY)
         self.generate_script_var = tk.BooleanVar(value=self.settings.generate_audiodata)
@@ -143,6 +166,7 @@ class DyingAudioApp(tk.Tk):
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
         self.loading_progress: ttk.Progressbar | None = None
+        self.loading_cancel_button: ttk.Button | None = None
         self.loading_gif_label: ttk.Label | None = None
         self._loading_gif_cache: dict[int, tk.PhotoImage] = {}
         self._loading_gif_frame_count: int | None = None
@@ -170,9 +194,21 @@ class DyingAudioApp(tk.Tk):
         self._preview_indeterminate = False
         self._preview_entry_name = ""
         self._preview_playback_kind: str | None = None
+        self.console_frame: ttk.Frame | None = None
+        self.console_notebook: ttk.Notebook | None = None
+        self.console_tab: ttk.Frame | None = None
+        self.log_text: ScrolledText | None = None
+        self._console_visible = True
+        self._welcome_window: tk.Toplevel | None = None
+        self._welcome_configure_after_id: str | None = None
+        self._menus: list[tk.Menu] = []
+        self.file_menu: tk.Menu | None = None
+        self._welcome_background_image: tk.PhotoImage | None = None
 
+        self._configure_high_contrast()
         self._build_ui()
         self._configure_dark_combobox_popdowns()
+        self._apply_text_widget_theme()
         self._load_proc_names()
         self._update_sort_controls()
         self._refresh_tree()
@@ -196,6 +232,8 @@ class DyingAudioApp(tk.Tk):
         self.entry_search_var.trace_add("write", self._on_entry_filter_changed)
         self.sort_field_var.trace_add("write", self._on_entry_filter_changed)
         self.sort_descending_var.trace_add("write", self._on_entry_filter_changed)
+        self.show_welcome_on_startup_var.trace_add("write", self._on_welcome_toggle_changed)
+        self.high_contrast_var.trace_add("write", self._on_high_contrast_changed)
         for traced_var in (
             self.selected_name_var,
             self.selected_type_var,
@@ -204,6 +242,7 @@ class DyingAudioApp(tk.Tk):
             self.selected_speech_intensity_var,
         ):
             traced_var.trace_add("write", self._on_selected_detail_changed)
+        self.after(250, self._maybe_show_welcome_wizard)
 
     def _apply_window_icon(self) -> None:
         icon_path = bundled_resource_root() / "assets" / "dyinglight_devtools.ico"
@@ -224,21 +263,15 @@ class DyingAudioApp(tk.Tk):
         except tk.TclError:
             pass
 
-        background = "#1e1e1e"
-        panel_background = "#252526"
-        field_background = "#2d2d30"
-        foreground = "#d4d4d4"
-        border_color = "#3f3f46"
-        selected_background = "#0a84ff"
-        selected_foreground = "#ffffff"
-        self._dark_theme_colors = {
-            "background": background,
-            "panel_background": panel_background,
-            "field_background": field_background,
-            "foreground": foreground,
-            "selected_background": selected_background,
-            "selected_foreground": selected_foreground,
-        }
+        colors = dark_palette()
+        self._dark_theme_colors = colors
+        background = colors["background"]
+        panel_background = colors["panel_background"]
+        field_background = colors["field_background"]
+        foreground = colors["foreground"]
+        border_color = colors["border_color"]
+        selected_background = colors["selected_background"]
+        selected_foreground = colors["selected_foreground"]
 
         self.configure(bg=background)
         self.option_add("*Background", background)
@@ -269,6 +302,7 @@ class DyingAudioApp(tk.Tk):
         )
         self.style.configure("TEntry", fieldbackground=field_background, foreground=foreground, background=background)
         self.style.configure("TCombobox", fieldbackground=field_background, foreground=foreground, background=background)
+        configure_dark_checkbutton_style(self.style)
         self.style.map(
             "TCombobox",
             fieldbackground=[("readonly", field_background), ("disabled", panel_background)],
@@ -303,6 +337,202 @@ class DyingAudioApp(tk.Tk):
             foreground=[("selected", foreground)],
         )
         self.style.configure("TProgressbar", troughcolor=panel_background, background=selected_background)
+
+    def _configure_high_contrast(self) -> None:
+        if not hasattr(self, "high_contrast_var"):
+            return
+        if not self.high_contrast_var.get():
+            if is_windows_dark_mode():
+                self._configure_appearance()
+                self._apply_text_widget_theme()
+            for menu in getattr(self, "_menus", []):
+                self._apply_menu_colors(menu)
+            if hasattr(self, "experimental_frame") and self.experimental_frame is not None:
+                self.experimental_frame.apply_theme(high_contrast=False)
+            if hasattr(self, "other_frame") and self.other_frame is not None:
+                self.other_frame.apply_theme(high_contrast=False)
+            return
+        style = getattr(self, "style", ttk.Style(self))
+        self.style = style
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        colors = high_contrast_palette()
+        background = colors["background"]
+        foreground = colors["foreground"]
+        selected = colors["selected_background"]
+        self.configure(bg=background)
+        self.option_add("*Background", background)
+        self.option_add("*foreground", foreground)
+        self.option_add("*FieldBackground", background)
+        self.option_add("*insertBackground", foreground)
+        self.option_add("*selectColor", selected)
+        self.option_add("*selectBackground", selected)
+        self.option_add("*selectForeground", background)
+        self.option_add("*Menu.background", background)
+        self.option_add("*Menu.foreground", foreground)
+        self.option_add("*Menu.activeBackground", selected)
+        self.option_add("*Menu.activeForeground", background)
+        style.configure(".", background=background, foreground=foreground)
+        style.configure("TFrame", background=background)
+        style.configure("TLabelframe", background=background, foreground=foreground, bordercolor=foreground)
+        style.configure("TLabelframe.Label", background=background, foreground=foreground)
+        style.configure("TLabel", background=background, foreground=foreground)
+        style.configure("TEntry", fieldbackground=background, foreground=foreground, background=background, insertcolor=foreground)
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", "#202020"), ("readonly", background), ("!disabled", background)],
+            foreground=[("disabled", "#808080"), ("readonly", foreground), ("!disabled", foreground)],
+            selectbackground=[("!disabled", selected)],
+            selectforeground=[("!disabled", background)],
+        )
+        style.configure("TCombobox", fieldbackground=background, foreground=foreground, background=background, arrowcolor=foreground)
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", background), ("disabled", "#202020"), ("!disabled", background)],
+            foreground=[("readonly", foreground), ("disabled", "#808080"), ("!disabled", foreground)],
+            background=[("readonly", background), ("disabled", "#202020"), ("!disabled", background)],
+            selectbackground=[("readonly", selected), ("!disabled", selected)],
+            selectforeground=[("readonly", background), ("!disabled", background)],
+            arrowcolor=[("readonly", foreground), ("disabled", "#808080"), ("!disabled", foreground)],
+        )
+        style.configure(
+            "TButton",
+            background=background,
+            foreground=foreground,
+            bordercolor=foreground,
+            lightcolor=foreground,
+            darkcolor=foreground,
+            focuscolor=selected,
+        )
+        style.map(
+            "TButton",
+            background=[("active", selected), ("pressed", selected), ("disabled", "#202020")],
+            foreground=[("active", background), ("pressed", background), ("disabled", "#808080")],
+        )
+        configure_high_contrast_checkbutton_style(style)
+        style.configure("TNotebook", background=background, bordercolor=foreground)
+        style.configure("TNotebook.Tab", background=background, foreground=foreground, focuscolor=selected)
+        style.map("TNotebook.Tab", background=[("selected", selected)], foreground=[("selected", background)])
+        style.configure("Treeview", background=background, fieldbackground=background, foreground=foreground, bordercolor=foreground)
+        style.configure("Treeview.Heading", background=background, foreground=foreground, bordercolor=foreground)
+        style.map("Treeview", background=[("selected", selected)], foreground=[("selected", background)])
+        style.configure("TProgressbar", troughcolor=background, background=selected, bordercolor=foreground)
+        style.configure("Horizontal.TScale", background=background, troughcolor=foreground)
+        style.configure("Vertical.TScale", background=background, troughcolor=foreground)
+        for menu in getattr(self, "_menus", []):
+            self._apply_menu_colors(menu)
+        if hasattr(self, "notebook"):
+            self._apply_high_contrast_to_widget(self)
+            self._configure_high_contrast_combobox_popdowns()
+        self._apply_text_widget_theme()
+        if hasattr(self, "experimental_frame") and self.experimental_frame is not None:
+            self.experimental_frame.apply_theme(high_contrast=True)
+        if hasattr(self, "other_frame") and self.other_frame is not None:
+            self.other_frame.apply_theme(high_contrast=True)
+
+    def _apply_high_contrast_to_widget(self, widget: tk.Misc) -> None:
+        if not self.high_contrast_var.get():
+            return
+        background = "#000000"
+        foreground = "#ffffff"
+        selected = "#ffff00"
+        for child in self._iter_child_widgets(widget):
+            try:
+                if isinstance(child, tk.Text):
+                    child.configure(
+                        background=background,
+                        foreground=foreground,
+                        insertbackground=foreground,
+                        selectbackground=selected,
+                        selectforeground=background,
+                        highlightbackground=foreground,
+                        highlightcolor=selected,
+                    )
+                elif isinstance(child, tk.Entry):
+                    child.configure(
+                        background=background,
+                        foreground=foreground,
+                        insertbackground=foreground,
+                        selectbackground=selected,
+                        selectforeground=background,
+                        highlightbackground=foreground,
+                        highlightcolor=selected,
+                    )
+                elif isinstance(child, tk.Listbox):
+                    child.configure(
+                        background=background,
+                        foreground=foreground,
+                        selectbackground=selected,
+                        selectforeground=background,
+                        highlightbackground=foreground,
+                        highlightcolor=selected,
+                    )
+                elif isinstance(child, tk.Canvas):
+                    child.configure(background=background, highlightbackground=background)
+                elif isinstance(child, tk.Menu):
+                    self._apply_menu_colors(child)
+            except tk.TclError:
+                pass
+
+    def _apply_text_widget_theme(self) -> None:
+        if not hasattr(self, "proc_text") or self.proc_text is None:
+            return
+        if self.high_contrast_var.get():
+            colors = high_contrast_palette()
+        elif is_windows_dark_mode():
+            colors = dark_palette()
+        else:
+            return
+        for widget in (
+            getattr(self, "proc_text", None),
+            getattr(self, "preview_text", None),
+            getattr(self, "log_text", None),
+        ):
+            if widget is not None:
+                style_scrolled_text(widget, colors)
+
+    def _configure_high_contrast_combobox_popdowns(self) -> None:
+        for widget in self._iter_child_widgets(self):
+            if not isinstance(widget, ttk.Combobox):
+                continue
+            try:
+                popdown = self.tk.eval(f"ttk::combobox::PopdownWindow {widget}")
+                listbox = f"{popdown}.f.l"
+                self.tk.call(
+                    listbox,
+                    "configure",
+                    "-background",
+                    "#000000",
+                    "-foreground",
+                    "#ffffff",
+                    "-selectbackground",
+                    "#ffff00",
+                    "-selectforeground",
+                    "#000000",
+                )
+            except tk.TclError:
+                pass
+
+    def _apply_menu_colors(self, menu: tk.Menu) -> None:
+        if self.high_contrast_var.get():
+            menu.configure(
+                background="#000000",
+                foreground="#ffffff",
+                activebackground="#ffff00",
+                activeforeground="#000000",
+                selectcolor="#ffff00",
+            )
+            return
+        if is_windows_dark_mode():
+            menu.configure(
+                background="#1e1e1e",
+                foreground="#d4d4d4",
+                activebackground="#252526",
+                activeforeground="#d4d4d4",
+                selectcolor="#0a84ff",
+            )
 
     def _iter_child_widgets(self, widget: tk.Misc) -> list[tk.Misc]:
         descendants: list[tk.Misc] = []
@@ -346,12 +576,105 @@ class DyingAudioApp(tk.Tk):
         self.status_var.set("An unexpected error occurred.")
         self._show_error_window("Unexpected error", str(val))
 
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self)
+        self._menus = [menubar]
+
+        file_menu = tk.Menu(menubar, tearoff=False)
+        self.file_menu = file_menu
+        self._menus.append(file_menu)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=False)
+        self._menus.append(settings_menu)
+        settings_menu.add_command(label="Folders and Tools...", command=self._show_settings_window)
+        settings_menu.add_command(label="Open Welcome Menu", command=lambda: self._show_welcome_wizard(force=True))
+        settings_menu.add_checkbutton(
+            label="Show Welcome On Startup",
+            variable=self.show_welcome_on_startup_var,
+            command=self._save_settings,
+        )
+        settings_menu.add_checkbutton(
+            label="High Contrast Mode",
+            variable=self.high_contrast_var,
+            command=self._on_high_contrast_changed,
+        )
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+
+        tabs_menu = tk.Menu(menubar, tearoff=False)
+        self._menus.append(tabs_menu)
+        tabs_menu.add_command(label="Dying Light 1", command=lambda: self._select_main_tab(self.dl1_tab))
+        tabs_menu.add_command(
+            label="Dying Light 2 / The Beast",
+            command=lambda: self._select_main_tab(self.experimental_frame),
+        )
+        tabs_menu.add_command(label="Other", command=lambda: self._select_main_tab(self.other_frame))
+        tabs_menu.add_separator()
+        tabs_menu.add_command(label="Open Console", command=self._show_console_panel)
+        tabs_menu.add_command(label="Close Console", command=self._hide_console_panel)
+        menubar.add_cascade(label="Tabs", menu=tabs_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        self._menus.append(help_menu)
+        help_menu.add_command(label="Tool Status...", command=self._show_tool_status_window)
+        # help_menu.add_command(label="Welcome Guide...", command=lambda: self._show_welcome_wizard(force=True))
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        for menu in self._menus:
+            self._apply_menu_colors(menu)
+        self.config(menu=menubar)
+
+    def _refresh_file_menu(self, _event: object | None = None) -> None:
+        if self.file_menu is None or not hasattr(self, "notebook") or not hasattr(self, "dl1_tab"):
+            return
+        self.file_menu.delete(0, tk.END)
+        selected = self.notebook.select() if hasattr(self, "notebook") else ""
+        selected_widget = self.nametowidget(selected) if selected else None
+        if selected_widget is self.dl1_tab:
+            self.file_menu.add_command(label="Open CSB For Edit...", command=self._open_csb_for_editing)
+            self.file_menu.add_command(label="Save CSB File...", command=self._save_csb_file)
+            self.file_menu.add_command(label="Extract CSB...", command=self._extract_csb)
+            self.file_menu.add_command(label="Inspect CSB...", command=self._inspect_csb)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Add Audio / FSB...", command=self._add_source_files)
+            self.file_menu.add_command(label="Import Manifest...", command=self._import_manifest)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Clear DL1 Cache...", command=self._clear_dl1_cache)
+        elif selected_widget is self.experimental_frame and self.experimental_frame is not None:
+            workspace = self.experimental_frame
+            self.file_menu.add_command(label="Build / Refresh Workspace", command=workspace._build_workspace)
+            self.file_menu.add_command(label="Export Selected Media...", command=workspace._export_selected_media)
+            self.file_menu.add_command(label="Export Mixed Audio...", command=workspace._export_selected_media_mixed)
+            self.file_menu.add_command(label="Export Selected Event Folder...", command=workspace._export_selected_event)
+            self.file_menu.add_command(label="Export Selected Bank Files...", command=workspace._export_selected_bank_files)
+            self.file_menu.add_command(label="Export Workspace Dump...", command=workspace._export_workspace_dump)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Replace Selected Audio...", command=workspace._replace_selected_media_aesp)
+            self.file_menu.add_command(label="Restore Original AESP...", command=workspace._restore_aesp_archive)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Open Cache Folder", command=workspace._open_cache_folder)
+            self.file_menu.add_command(label="Clear Cache...", command=workspace._clear_cache)
+        elif selected_widget is self.other_frame and self.other_frame is not None:
+            workspace = self.other_frame
+            self.file_menu.add_command(label="Build / Refresh Workspace", command=workspace._build_workspace)
+            self.file_menu.add_command(label="Export Selected Media...", command=workspace._export_selected_media)
+            self.file_menu.add_command(label="Export Mixed Audio...", command=workspace._export_selected_media_mixed)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Replace Selected Audio...", command=workspace._replace_selected_media)
+            self.file_menu.add_separator()
+            self.file_menu.add_command(label="Open Cache Folder", command=workspace._open_cache_folder)
+            self.file_menu.add_command(label="Clear Cache...", command=workspace._clear_cache)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self._on_close)
+
     def _build_ui(self) -> None:
+        self._build_menu()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.notebook.bind("<<NotebookTabChanged>>", self._refresh_file_menu)
 
         self.dl1_tab = ttk.Frame(self.notebook)
         self.dl1_tab.columnconfigure(0, weight=1)
@@ -359,10 +682,11 @@ class DyingAudioApp(tk.Tk):
         self.notebook.add(self.dl1_tab, text="Dying Light 1")
 
         self.experimental_frame = ExperimentalWwiseFrame(self.notebook, self.settings.experimental, self)
-        self.notebook.add(self.experimental_frame, text="Dying Light 2 / The Beast (Experimental)")
+        self.notebook.add(self.experimental_frame, text="Dying Light 2 / The Beast")
 
         self.other_frame = OtherWorkspaceFrame(self.notebook, self.settings.other, self)
         self.notebook.add(self.other_frame, text="Other")
+        self._refresh_file_menu()
 
         self.main_frame = ttk.Frame(self.dl1_tab)
         self.main_frame.grid(row=0, column=0, sticky="nsew")
@@ -370,7 +694,7 @@ class DyingAudioApp(tk.Tk):
         self.main_frame.rowconfigure(1, weight=3)
         self.main_frame.rowconfigure(2, weight=2)
 
-        settings_frame = ttk.LabelFrame(self.main_frame, text="Build Output")
+        settings_frame = ttk.LabelFrame(self.main_frame, text="Project")
         settings_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
         for column in range(8):
             settings_frame.columnconfigure(column, weight=1)
@@ -394,29 +718,21 @@ class DyingAudioApp(tk.Tk):
             state="readonly",
         ).grid(row=0, column=7, sticky="ew", padx=6, pady=6)
 
-        ttk.Label(settings_frame, text="Mods Root").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(settings_frame, textvariable=self.mods_root_var).grid(row=1, column=1, columnspan=6, sticky="ew", padx=6, pady=6)
-        ttk.Button(settings_frame, text="Browse", command=self._browse_mods_root).grid(row=1, column=7, sticky="ew", padx=6, pady=6)
-
-        ttk.Label(settings_frame, text="DLDT Root").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(settings_frame, textvariable=self.dldt_root_var).grid(row=2, column=1, columnspan=6, sticky="ew", padx=6, pady=6)
-        ttk.Button(settings_frame, text="Browse", command=self._browse_dldt_root).grid(row=2, column=7, sticky="ew", padx=6, pady=6)
-
         ttk.Checkbutton(
             settings_frame,
             text="Localized speech bank",
             variable=self.localized_bank_var,
             command=self._update_script_preview,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=6)
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=6)
         ttk.Checkbutton(
             settings_frame,
             text="Generate SPB",
             variable=self.generate_spb_var,
             command=self._on_generate_spb_toggle,
-        ).grid(row=3, column=2, sticky="w", padx=6, pady=6)
-        ttk.Label(settings_frame, text="Text Source").grid(row=3, column=3, sticky="w", padx=6, pady=6)
+        ).grid(row=1, column=2, sticky="w", padx=6, pady=6)
+        ttk.Label(settings_frame, text="Text Source").grid(row=1, column=3, sticky="w", padx=6, pady=6)
         ttk.Entry(settings_frame, textvariable=self.speech_text_source_var).grid(
-            row=3,
+            row=1,
             column=4,
             columnspan=3,
             sticky="ew",
@@ -424,14 +740,14 @@ class DyingAudioApp(tk.Tk):
             pady=6,
         )
         ttk.Button(settings_frame, text="Browse", command=self._browse_speech_text_source).grid(
-            row=3,
+            row=1,
             column=7,
             sticky="ew",
             padx=6,
             pady=6,
         )
         ttk.Label(settings_frame, textvariable=self.speech_summary_var).grid(
-            row=4,
+            row=2,
             column=0,
             columnspan=8,
             sticky="w",
@@ -439,7 +755,7 @@ class DyingAudioApp(tk.Tk):
             pady=(0, 6),
         )
         self.global_speech_intensity_frame = ttk.Frame(settings_frame)
-        self.global_speech_intensity_frame.grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
+        self.global_speech_intensity_frame.grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
         self.global_speech_intensity_frame.columnconfigure(1, weight=1)
         ttk.Label(self.global_speech_intensity_frame, text="Global Speech Intensity").grid(
             row=0, column=0, sticky="w", padx=(0, 6)
@@ -461,29 +777,14 @@ class DyingAudioApp(tk.Tk):
         self.global_speech_intensity_entry.bind("<FocusOut>", self._sync_global_speech_intensity_from_entry)
         self.global_speech_intensity_entry.bind("<Return>", self._sync_global_speech_intensity_from_entry)
         ttk.Label(settings_frame, textvariable=self.toolchain_status_var).grid(
-            row=5,
+            row=4,
             column=0,
-            columnspan=8,
+            columnspan=5,
             sticky="w",
             padx=6,
             pady=(0, 6),
         )
-        ttk.Label(settings_frame, textvariable=self.loaded_csb_var).grid(
-            row=6,
-            column=0,
-            columnspan=8,
-            sticky="w",
-            padx=6,
-            pady=(0, 6),
-        )
-        ttk.Label(settings_frame, textvariable=self.preview_tools_var).grid(
-            row=7,
-            column=0,
-            columnspan=8,
-            sticky="w",
-            padx=6,
-            pady=(0, 6),
-        )
+        ttk.Label(settings_frame, textvariable=self.status_var).grid(row=4, column=5, columnspan=3, sticky="e", padx=6, pady=(0, 6))
 
         content = ttk.Panedwindow(self.main_frame, orient="horizontal")
         content.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
@@ -501,6 +802,7 @@ class DyingAudioApp(tk.Tk):
         self._build_entries_frame(left)
         self._build_detail_frame(right)
         self._build_bottom_frame()
+        self._configure_high_contrast()
 
     def _build_entries_frame(self, parent: ttk.Frame) -> None:
         entries_frame = ttk.LabelFrame(parent, text="Audio Entries")
@@ -692,33 +994,30 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(script_frame, text="Preview").grid(row=3, column=0, sticky="w", padx=6, pady=(0, 6))
         self.preview_text = ScrolledText(script_frame, height=10, wrap="none", state="disabled")
         self.preview_text.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self._apply_text_widget_theme()
 
     def _build_bottom_frame(self) -> None:
-        bottom = ttk.Frame(self.main_frame)
-        bottom.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
-        bottom.columnconfigure(0, weight=1)
-        bottom.rowconfigure(1, weight=1)
+        self.console_frame = ttk.Frame(self.main_frame)
+        self.console_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        self.console_frame.columnconfigure(0, weight=1)
+        self.console_frame.rowconfigure(0, weight=1)
 
-        actions = ttk.Frame(bottom)
-        actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        for index in range(7):
-            actions.columnconfigure(index, weight=1)
+        self.console_notebook = ttk.Notebook(self.console_frame)
+        self.console_notebook.grid(row=0, column=0, sticky="nsew")
+        self.console_tab = ttk.Frame(self.console_notebook)
+        self.console_tab.columnconfigure(0, weight=1)
+        self.console_tab.rowconfigure(1, weight=1)
+        self.console_notebook.add(self.console_tab, text="Console")
 
-        self.open_csb_button = ttk.Button(actions, text="Open CSB For Edit", command=self._open_csb_for_editing)
-        self.open_csb_button.grid(row=0, column=0, sticky="ew", padx=2)
-        self.inspect_csb_button = ttk.Button(actions, text="Inspect CSB", command=self._inspect_csb)
-        self.inspect_csb_button.grid(row=0, column=1, sticky="ew", padx=2)
-        self.extract_csb_button = ttk.Button(actions, text="Extract CSB", command=self._extract_csb)
-        self.extract_csb_button.grid(row=0, column=2, sticky="ew", padx=2)
-        self.save_csb_button = ttk.Button(actions, text="Save CSB File", command=self._save_csb_file)
-        self.save_csb_button.grid(row=0, column=3, sticky="ew", padx=2)
-        self.build_mod_button = ttk.Button(actions, text="Build Mod", command=self._build_mod)
-        self.build_mod_button.grid(row=0, column=4, sticky="ew", padx=2)
-        self.open_mod_folder_button = ttk.Button(actions, text="Open Mod Folder", command=self._open_mod_folder)
-        self.open_mod_folder_button.grid(row=0, column=5, sticky="ew", padx=2)
-        self.clear_cache_button = ttk.Button(actions, text="Clear Cache", command=self._clear_dl1_cache)
-        self.clear_cache_button.grid(row=0, column=6, sticky="ew", padx=2)
-        ttk.Label(actions, textvariable=self.status_var).grid(row=1, column=0, columnspan=7, sticky="e", padx=4, pady=(4, 0))
+        console_toolbar = ttk.Frame(self.console_tab)
+        console_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        console_toolbar.columnconfigure(0, weight=1)
+        ttk.Label(console_toolbar, text="DyingAudio console").grid(row=0, column=0, sticky="w")
+        ttk.Button(console_toolbar, text="Close", command=self._hide_console_panel).grid(row=0, column=1, sticky="e")
+
+        self.log_text = ScrolledText(self.console_tab, height=9, wrap="word")
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self._apply_text_widget_theme()
         self._dl1_busy_widgets = [
             self.add_source_button,
             self.import_manifest_button,
@@ -727,17 +1026,7 @@ class DyingAudioApp(tk.Tk):
             self.move_up_button,
             self.move_down_button,
             self.clear_entries_button,
-            self.open_csb_button,
-            self.inspect_csb_button,
-            self.extract_csb_button,
-            self.save_csb_button,
-            self.build_mod_button,
-            self.open_mod_folder_button,
-            self.clear_cache_button,
         ]
-
-        self.log_text = ScrolledText(bottom, height=9, wrap="word")
-        self.log_text.grid(row=1, column=0, sticky="nsew")
 
     def _load_proc_names(self) -> None:
         proc_names = self.settings.audio_proc_names or list(DEFAULT_AUDIO_PROCS)
@@ -750,6 +1039,17 @@ class DyingAudioApp(tk.Tk):
         self._update_toolchain_status()
         self._update_speech_summary()
         self._update_script_preview()
+
+    def _on_welcome_toggle_changed(self, *_args: object) -> None:
+        self._save_settings()
+
+    def _on_high_contrast_changed(self, *_args: object) -> None:
+        self._configure_high_contrast()
+        if self._welcome_window is not None and self._welcome_window.winfo_exists():
+            refresh = getattr(self._welcome_window, "_dyingaudio_refresh", None)
+            if callable(refresh):
+                refresh()
+        self._save_settings()
 
     def _on_entry_filter_changed(self, *_args: object) -> None:
         self._update_sort_controls()
@@ -877,6 +1177,28 @@ class DyingAudioApp(tk.Tk):
         for widget in self._dl1_busy_widgets:
             widget.configure(state="disabled" if busy else "normal")
 
+    def _select_main_tab(self, tab: tk.Widget | None) -> None:
+        if tab is None:
+            return
+        self.notebook.select(tab)
+
+    def _show_console_panel(self) -> None:
+        if self.console_frame is None:
+            return
+        if not self._console_visible:
+            self.console_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+            self.main_frame.rowconfigure(2, weight=2)
+            self._console_visible = True
+        if self.console_notebook is not None and self.console_tab is not None:
+            self.console_notebook.select(self.console_tab)
+
+    def _hide_console_panel(self) -> None:
+        if self.console_frame is None:
+            return
+        self.console_frame.grid_remove()
+        self.main_frame.rowconfigure(2, weight=0)
+        self._console_visible = False
+
     def _cancel_loading_animation(self) -> None:
         if self._loading_gif_after_id is None:
             return
@@ -965,6 +1287,7 @@ class DyingAudioApp(tk.Tk):
         container.rowconfigure(0, weight=0)
         container.rowconfigure(1, weight=1)
         container.rowconfigure(2, weight=0)
+        container.rowconfigure(3, weight=0)
 
         status_frame = ttk.Frame(container, height=68)
         status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -984,9 +1307,13 @@ class DyingAudioApp(tk.Tk):
         progress = ttk.Progressbar(container, maximum=100, variable=self.task_progress_var)
         progress.grid(row=2, column=0, sticky="ew")
 
+        cancel_button = ttk.Button(container, text="Cancel", command=self._cancel_current_task)
+        cancel_button.grid(row=3, column=0, sticky="e", pady=(14, 0))
+
         self.loading_window = window
         self.loading_status_label = status_label
         self.loading_progress = progress
+        self.loading_cancel_button = cancel_button
         self.loading_gif_label = gif_label
         self.task_status_var.set(message)
 
@@ -1022,6 +1349,7 @@ class DyingAudioApp(tk.Tk):
         self.loading_window = None
         self.loading_status_label = None
         self.loading_progress = None
+        self.loading_cancel_button = None
         self.loading_gif_label = None
 
     def _apply_task_progress(self, progress: TaskProgress) -> None:
@@ -1063,6 +1391,16 @@ class DyingAudioApp(tk.Tk):
     def _ask_string_window(self, title: str, prompt: str, *, initialvalue: str = "") -> str | None:
         return ask_string_dialog(self, title, prompt, initialvalue=initialvalue)
 
+    def _cancel_current_task(self) -> None:
+        if not self.task_runner.is_running:
+            self._close_loading_window()
+            return
+        self.task_status_var.set("Cancelling...")
+        self.status_var.set("Cancelling task...")
+        if self.loading_cancel_button is not None:
+            self.loading_cancel_button.configure(state="disabled")
+        self.task_runner.cancel()
+
     def _run_dl1_task(
         self,
         *,
@@ -1081,6 +1419,11 @@ class DyingAudioApp(tk.Tk):
         self._show_loading_window(start_message)
 
         def handle_error(exc: BaseException, details: str) -> None:
+            if isinstance(exc, TaskCancelled):
+                self._append_log("Task cancelled.")
+                self.task_status_var.set("Task cancelled.")
+                self.status_var.set("Task cancelled.")
+                return
             self._append_log(details.rstrip())
             self._show_error_window(error_title, str(exc))
             self.status_var.set(error_title.replace(" failed", " failed."))
@@ -1124,7 +1467,7 @@ class DyingAudioApp(tk.Tk):
         root = self._resolve_dldt_root(allow_discovery=False)
         if root is None:
             self.current_toolchain = None
-            self.toolchain_status_var.set("DLDT toolchain not selected. Click Browse to auto-find it.")
+            self.toolchain_status_var.set("DLDT toolchain not selected. Use Settings > Folders and Tools.")
             return
         toolchain, errors = discover_toolchain(root)
         self.current_toolchain = toolchain
@@ -1200,6 +1543,8 @@ class DyingAudioApp(tk.Tk):
 
     def _append_log(self, message: str) -> None:
         if not message:
+            return
+        if self.log_text is None:
             return
         self.log_text.insert(tk.END, message.rstrip() + "\n")
         self.log_text.see(tk.END)
@@ -1350,8 +1695,10 @@ class DyingAudioApp(tk.Tk):
         self.loaded_csb_path = Path(path).resolve() if path else None
         if self.loaded_csb_path is None:
             self.loaded_csb_var.set("Loaded CSB: none")
+            self._append_log("Loaded CSB: none")
         else:
             self.loaded_csb_var.set(f"Loaded CSB: {self.loaded_csb_path}")
+            self._append_log(f"Loaded CSB: {self.loaded_csb_path}")
 
     def _set_loaded_csb_magic(self, magic: int | None) -> None:
         self.loaded_csb_magic = magic
@@ -1455,6 +1802,532 @@ class DyingAudioApp(tk.Tk):
         if selection:
             self.speech_text_source_var.set(str(Path(selection).resolve()))
             self._save_settings()
+
+    def _tool_settings_snapshot(self) -> ToolSettings:
+        return ToolSettings(
+            ffmpeg_root=self.ffmpeg_root_var.get().strip(),
+            vgmstream_root=self.vgmstream_root_var.get().strip(),
+            wwise_root=self.wwise_root_var.get().strip(),
+            show_welcome_on_startup=self.show_welcome_on_startup_var.get(),
+            high_contrast_mode=self.high_contrast_var.get(),
+        )
+
+    def _refresh_tool_discovery(self) -> None:
+        self.preview_player.environment = discover_media_tools(self._tool_settings_snapshot())
+        self.preview_tools_var.set(self.preview_player.environment.summary())
+        self._update_preview_info()
+
+    def _browse_folder_into_var(self, target_var: tk.StringVar, title: str, *, discovery: Callable[[], Path | None] | None = None) -> None:
+        selection = discovery() if discovery is not None else None
+        if selection is None:
+            current = target_var.get().strip()
+            initialdir = current if current and Path(current).expanduser().exists() else None
+            chosen = filedialog.askdirectory(title=title, initialdir=initialdir)
+            if chosen:
+                selection = Path(chosen).resolve()
+        if selection is not None:
+            target_var.set(str(selection))
+            self._apply_folder_settings()
+
+    def _apply_folder_settings(self) -> None:
+        if self.experimental_frame is not None:
+            self.experimental_frame._game_roots[DL2_GAME] = self.dl2_root_var.get().strip()
+            self.experimental_frame._game_roots[DLTB_GAME] = self.dltb_root_var.get().strip()
+            if self.experimental_frame.game_var.get() == DL2_GAME:
+                self.experimental_frame.install_root_var.set(self.dl2_root_var.get().strip())
+            elif self.experimental_frame.game_var.get() == DLTB_GAME:
+                self.experimental_frame.install_root_var.set(self.dltb_root_var.get().strip())
+            self.experimental_frame.cache_root_var.set(self.experimental_cache_root_var.get().strip() or DEFAULT_EXPERIMENTAL_CACHE_ROOT)
+            self.experimental_frame.preview_player.environment = discover_media_tools(self._tool_settings_snapshot())
+            self.experimental_frame.preview_tools_var.set(self.experimental_frame.preview_player.environment.summary())
+        if self.other_frame is not None:
+            self.other_frame.root_var.set(self.other_root_var.get().strip())
+            self.other_frame.cache_root_var.set(self.other_cache_root_var.get().strip() or DEFAULT_OTHER_CACHE_ROOT)
+            self.other_frame.preview_player.environment = discover_media_tools(self._tool_settings_snapshot())
+            self.other_frame.preview_tools_var.set(self.other_frame.preview_player.environment.summary())
+        self._refresh_tool_discovery()
+        self._update_toolchain_status()
+        self._save_settings()
+
+    def _show_settings_window(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Folders and Tools")
+        window.transient(self)
+        window.geometry("920x560")
+        window.minsize(760, 460)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(window, padding=14)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        fields = ttk.Frame(container)
+        fields.grid(row=0, column=0, sticky="nsew")
+        fields.columnconfigure(1, weight=1)
+
+        rows: list[tuple[str, tk.StringVar, str, Callable[[], Path | None] | None]] = [
+            ("DLDT Root", self.dldt_root_var, "Select Dying Light Developer Tools root", discover_dldt_root),
+            ("DL1 Mods Root", self.mods_root_var, "Select Dying Light Mods root", discover_mods_root),
+            ("DL2 Root", self.dl2_root_var, "Select Dying Light 2 root", lambda: discover_game_root(DL2_GAME)),
+            ("The Beast Root", self.dltb_root_var, "Select Dying Light The Beast root", lambda: discover_game_root(DLTB_GAME)),
+            ("Other Pack Root", self.other_root_var, "Select pack root", None),
+            ("DL2/TB Cache Root", self.experimental_cache_root_var, "Select DL2/TB cache root", None),
+            ("Other Cache Root", self.other_cache_root_var, "Select Other cache root", None),
+            ("FFmpeg Folder", self.ffmpeg_root_var, "Select FFmpeg folder", None),
+            ("vgmstream Folder", self.vgmstream_root_var, "Select vgmstream folder", None),
+            ("Wwise Folder", self.wwise_root_var, "Select Wwise Authoring folder", None),
+        ]
+        for row, (label, variable, title, discovery) in enumerate(rows):
+            ttk.Label(fields, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Entry(fields, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=4)
+            ttk.Button(
+                fields,
+                text="Browse",
+                command=lambda var=variable, browse_title=title, discover=discovery: self._browse_folder_into_var(
+                    var,
+                    browse_title,
+                    discovery=discover,
+                ),
+            ).grid(row=row, column=2, sticky="ew", pady=4)
+
+        ttk.Checkbutton(
+            fields,
+            text="Show welcome menu on startup",
+            variable=self.show_welcome_on_startup_var,
+        ).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(12, 4))
+        ttk.Checkbutton(
+            fields,
+            text="High contrast mode",
+            variable=self.high_contrast_var,
+            command=self._on_high_contrast_changed,
+        ).grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(4, 4))
+
+        actions = ttk.Frame(container)
+        actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        actions.columnconfigure(0, weight=1)
+        ttk.Button(actions, text="Open Welcome Menu", command=lambda: self._show_welcome_wizard(force=True)).grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        ttk.Button(actions, text="Apply", command=self._apply_folder_settings).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="OK",
+            command=lambda: (self._apply_folder_settings(), window.destroy()),
+        ).grid(row=0, column=2)
+        self._center_child_window(window, 920, 560)
+        window.lift()
+
+    def _tool_status_rows(self) -> list[tuple[str, bool, str, tk.StringVar | None]]:
+        self._refresh_tool_discovery()
+        self._update_toolchain_status()
+        tools = self.preview_player.environment
+        dldt_ready = self._resolve_dldt_root(allow_discovery=False) is not None and self.current_toolchain is not None
+        return [
+            ("FFmpeg", tools.ffmpeg_path is not None, str(tools.ffmpeg_path or "Missing"), self.ffmpeg_root_var),
+            ("FFplay", tools.ffplay_path is not None, str(tools.ffplay_path or "Missing"), self.ffmpeg_root_var),
+            ("FFprobe", tools.ffprobe_path is not None, str(tools.ffprobe_path or "Missing"), self.ffmpeg_root_var),
+            ("vgmstream", tools.vgmstream_path is not None, str(tools.vgmstream_path or "Missing"), self.vgmstream_root_var),
+            ("Wwise 2023.1.13.8732", tools.wwise_console_path is not None, str(tools.wwise_console_path or "Missing"), self.wwise_root_var),
+            ("Dying Light Developer Tools", dldt_ready, self.toolchain_status_var.get(), self.dldt_root_var),
+        ]
+
+    def _all_welcome_requirements_ready(self) -> bool:
+        return all(installed for _label, installed, _detail, _var in self._tool_status_rows())
+
+    def _show_tool_status_window(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Tool Status")
+        window.transient(self)
+        window.geometry("760x420")
+        window.minsize(620, 340)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(window, padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        def redraw() -> None:
+            for child in frame.winfo_children():
+                child.destroy()
+            ttk.Label(frame, text="Tool Status", font=("TkDefaultFont", 14, "bold")).grid(
+                row=0,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                pady=(0, 12),
+            )
+            for index, (label, installed, detail, variable) in enumerate(self._tool_status_rows(), start=1):
+                color = "#2e7d32" if installed else "#c62828"
+                tk.Label(frame, text="Ready" if installed else "Missing", fg=color, anchor="w").grid(
+                    row=index,
+                    column=0,
+                    sticky="w",
+                    padx=(0, 10),
+                    pady=4,
+                )
+                ttk.Label(frame, text=label).grid(row=index, column=1, sticky="w", pady=4)
+                ttk.Label(frame, text=detail, wraplength=420).grid(row=index, column=2, sticky="w", pady=4)
+                if not installed and variable is not None:
+                    ttk.Button(
+                        frame,
+                        text="Browse",
+                        command=lambda var=variable: (self._browse_folder_into_var(var, "Select tool folder"), redraw()),
+                    ).grid(row=index, column=3, sticky="e", padx=(8, 0), pady=4)
+
+        redraw()
+        self._center_child_window(window, 760, 420)
+        window.lift()
+
+    def _maybe_show_welcome_wizard(self) -> None:
+        if not self.show_welcome_on_startup_var.get():
+            return
+        self._show_welcome_wizard(force=False)
+
+    def _browse_welcome_requirement(self, variable: tk.StringVar, title: str, refresh: Callable[[], None]) -> None:
+        self._browse_folder_into_var(variable, title)
+        refresh()
+
+    def _show_welcome_wizard(self, *, force: bool) -> None:
+        if self._welcome_window is not None and self._welcome_window.winfo_exists():
+            self._welcome_window.lift()
+            return
+        if not force and not self.show_welcome_on_startup_var.get():
+            return
+
+        start_screen = 2 if self._all_welcome_requirements_ready() else 1
+        screen_var = tk.IntVar(value=start_screen)
+        dont_show_var = tk.BooleanVar(value=not self.show_welcome_on_startup_var.get())
+
+        window = tk.Toplevel(self)
+        self._welcome_window = window
+        window.title("Welcome to Dying Audio")
+        window.transient(self)
+        window.geometry("1280x720")
+        window.minsize(960, 540)
+        window.resizable(True, True)
+        window.configure(bg="#000000")
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+
+        canvas = tk.Canvas(window, highlightthickness=0, bg="#000000")
+        canvas.pack(fill="both", expand=True)
+        landing_path = bundled_resource_root() / "assets" / "Landing.png"
+        landing_image: tk.PhotoImage | None = None
+        pil_image = None
+        image_tk_module = None
+        background_item = canvas.create_image(0, 0, anchor="nw")
+        try:
+            from PIL import Image, ImageTk
+
+            pil_image = Image.open(landing_path) if landing_path.exists() else None
+            image_tk_module = ImageTk
+        except (ImportError, OSError):
+            pil_image = None
+            image_tk_module = None
+        if landing_path.exists():
+            try:
+                landing_image = tk.PhotoImage(master=window, file=str(landing_path))
+            except tk.TclError:
+                landing_image = None
+        if landing_image is not None:
+            canvas.itemconfigure(background_item, image=landing_image, anchor="nw")
+            canvas.image = landing_image
+
+        def render_background(width: int, height: int) -> None:
+            if self.high_contrast_var.get():
+                canvas.configure(bg="#000000")
+                canvas.itemconfigure(background_item, image="")
+                return
+            if pil_image is not None and image_tk_module is not None:
+                resized = pil_image.resize((width, height))
+                self._welcome_background_image = image_tk_module.PhotoImage(resized)
+                canvas.itemconfigure(background_item, image=self._welcome_background_image, anchor="nw")
+            elif landing_image is not None:
+                canvas.itemconfigure(background_item, image=landing_image, anchor="nw")
+            else:
+                canvas.itemconfigure(background_item, image="")
+            canvas.coords(background_item, 0, 0)
+
+        panel = tk.Frame(canvas, bg="#000000", padx=18, pady=14, highlightthickness=0, borderwidth=0)
+        panel_window = canvas.create_window(854, 0, window=panel, anchor="nw", width=426, height=720)
+
+        def overlay_button(
+            parent: tk.Misc,
+            text: str,
+            command: Callable[[], None],
+            *,
+            accent: bool = False,
+        ) -> tk.Label:
+            border = "#ffff00" if self.high_contrast_var.get() or accent else "#ffffff"
+            foreground = "#ffff00" if accent else "#ffffff"
+            label = tk.Label(
+                parent,
+                text=text,
+                bg="#000000",
+                fg=foreground,
+                cursor="hand2",
+                highlightbackground=border,
+                highlightcolor="#ffff00",
+                highlightthickness=1,
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=6 if not accent else 4,
+            )
+            label.bind("<Button-1>", lambda _event: command())
+            label.bind("<Return>", lambda _event: (command(), "break")[1])
+            label.bind("<space>", lambda _event: (command(), "break")[1])
+            label.bind(
+                "<Enter>",
+                lambda _event: label.configure(bg="#ffff00", fg="#000000", highlightbackground="#ffff00"),
+            )
+            label.bind(
+                "<Leave>",
+                lambda _event: label.configure(bg="#000000", fg=foreground, highlightbackground=border),
+            )
+            return label
+
+        def welcome_checkbox(parent: tk.Misc, text: str, variable: tk.BooleanVar, command: Callable[[], None]) -> tk.Checkbutton:
+            return tk.Checkbutton(
+                parent,
+                text=text,
+                variable=variable,
+                command=command,
+                bg="#000000",
+                fg="#ffffff",
+                activebackground="#000000",
+                activeforeground="#ffffff",
+                selectcolor="#000000",
+                highlightbackground="#000000",
+                highlightcolor="#ffff00",
+                relief="flat",
+                borderwidth=0,
+            )
+
+        def apply_dont_show() -> None:
+            self.show_welcome_on_startup_var.set(not dont_show_var.get())
+            self._save_settings()
+
+        def toggle_high_contrast() -> None:
+            self.high_contrast_var.set(not self.high_contrast_var.get())
+            self._on_high_contrast_changed()
+
+        def close() -> None:
+            apply_dont_show()
+            window.destroy()
+
+        def select_workspace(tab: tk.Widget | None) -> None:
+            close()
+            self._select_main_tab(tab)
+
+        def add_header(text: str, row: int, size: int = 24) -> int:
+            tk.Label(
+                panel,
+                text=text,
+                fg="#ffffff",
+                bg="#000000",
+                font=("TkDefaultFont", size, "bold"),
+                anchor="w",
+                justify="left",
+                wraplength=380,
+            ).grid(
+                row=row,
+                column=0,
+                columnspan=3,
+                sticky="ew",
+                pady=(0, 14),
+            )
+            return row + 1
+
+        def add_status_row(row: int, label: str, installed: bool, detail: str, variable: tk.StringVar | None) -> int:
+            color = "#67d36f" if installed else "#ff4d4d"
+            tk.Label(panel, text=label, fg="#ffffff", bg="#000000", anchor="w", justify="left").grid(
+                row=row,
+                column=0,
+                sticky="w",
+                pady=3,
+            )
+            tk.Label(panel, text="Ready" if installed else "Missing", fg=color, bg="#000000", anchor="w").grid(
+                row=row,
+                column=1,
+                sticky="w",
+                padx=(8, 0),
+                pady=3,
+            )
+            if not installed and variable is not None:
+                overlay_button(
+                    panel,
+                    text="Browse",
+                    command=lambda var=variable: self._browse_welcome_requirement(var, f"Select {label} folder", redraw),
+                ).grid(row=row, column=2, sticky="e", padx=(8, 0), pady=3)
+            elif detail and detail != "Missing":
+                tk.Label(panel, text=Path(detail).name, fg="#b8b8b8", bg="#000000", anchor="e").grid(
+                    row=row,
+                    column=2,
+                    sticky="e",
+                    padx=(8, 0),
+                    pady=3,
+                )
+            return row + 1
+
+        def redraw() -> None:
+            for child in panel.winfo_children():
+                child.destroy()
+            panel.columnconfigure(0, weight=1)
+            panel.columnconfigure(1, weight=0)
+            panel.columnconfigure(2, weight=0)
+            panel.rowconfigure(99, weight=1)
+            overlay_button(
+                panel,
+                f"High Contrast: {'On' if self.high_contrast_var.get() else 'Off'}",
+                toggle_high_contrast,
+                accent=True,
+            ).grid(
+                row=0,
+                column=2,
+                sticky="ne",
+                pady=(0, 8),
+            )
+
+            row = 1
+            if screen_var.get() == 1:
+                row = add_header("Welcome to Dying Audio", row, size=22)
+                tk.Label(
+                    panel,
+                    text="Before you start a project, please make sure you have the following tools installed:",
+                    fg="#ffffff",
+                    bg="#000000",
+                    wraplength=360,
+                    justify="left",
+                    anchor="w",
+                ).grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 18))
+                row += 1
+
+                tk.Label(panel, text="Required for audio playback:", fg="#ffffff", bg="#000000", font=("TkDefaultFont", 11, "bold")).grid(
+                    row=row,
+                    column=0,
+                    columnspan=3,
+                    sticky="w",
+                    pady=(0, 8),
+                )
+                row += 1
+                status_rows = self._tool_status_rows()
+                playback_names = {"FFmpeg", "FFplay", "FFprobe", "vgmstream"}
+                editing_names = {"Wwise 2023.1.13.8732", "Dying Light Developer Tools"}
+                for label, installed, detail, variable in status_rows:
+                    if label in playback_names:
+                        row = add_status_row(row, label, installed, detail, variable)
+
+                row += 1
+                tk.Label(panel, text="Required for audio editing:", fg="#ffffff", bg="#000000", font=("TkDefaultFont", 11, "bold")).grid(
+                    row=row,
+                    column=0,
+                    columnspan=3,
+                    sticky="w",
+                    pady=(12, 8),
+                )
+                row += 1
+                tk.Label(panel, text="DL2/TB Only:", fg="#f0a033", bg="#000000", font=("TkDefaultFont", 10, "bold")).grid(
+                    row=row,
+                    column=0,
+                    columnspan=3,
+                    sticky="w",
+                )
+                row += 1
+                for label, installed, detail, variable in status_rows:
+                    if label == "Wwise 2023.1.13.8732":
+                        row = add_status_row(row, label, installed, detail, variable)
+                tk.Label(panel, text="DL1 Only:", fg="#f0a033", bg="#000000", font=("TkDefaultFont", 10, "bold")).grid(
+                    row=row,
+                    column=0,
+                    columnspan=3,
+                    sticky="w",
+                    pady=(8, 0),
+                )
+                row += 1
+                for label, installed, detail, variable in status_rows:
+                    if label in editing_names and label != "Wwise 2023.1.13.8732":
+                        row = add_status_row(row, label, installed, detail, variable)
+
+                overlay_button(panel, "Continue", lambda: (screen_var.set(2), redraw())).grid(
+                    row=99,
+                    column=0,
+                    columnspan=3,
+                    sticky="ew",
+                    pady=(18, 0),
+                )
+                return
+
+            row = add_header("MAIN MENU", row, size=24)
+            panel.rowconfigure(20, weight=1)
+            buttons = tk.Frame(panel, bg="#000000", highlightthickness=0, borderwidth=0)
+            buttons.grid(row=20, column=0, columnspan=3, sticky="nsew")
+            buttons.columnconfigure(0, weight=1)
+            buttons.rowconfigure(0, weight=1)
+            buttons.rowconfigure(3, weight=1)
+            overlay_button(buttons, "Dying Light 1 Workspace", lambda: select_workspace(self.dl1_tab)).grid(
+                row=1,
+                column=0,
+                sticky="ew",
+                pady=(0, 12),
+            )
+            overlay_button(
+                buttons,
+                "Dying Light 2 / The Beast Workspace",
+                lambda: select_workspace(self.experimental_frame),
+            ).grid(
+                row=2,
+                column=0,
+                sticky="ew"
+            )
+            welcome_checkbox(
+                panel,
+                "Don't show this again",
+                dont_show_var,
+                apply_dont_show,
+            ).grid(
+                row=99,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                pady=(18, 0)
+            )
+
+        def on_configure(event: tk.Event) -> None:
+            if event.widget is not window:
+                return
+            width = max(960, event.width)
+            height = max(540, event.height)
+            render_background(width, height)
+            canvas.coords(panel_window, int(width * 2 / 3), 0)
+            canvas.itemconfigure(panel_window, width=max(320, width // 3), height=height)
+            for child in panel.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(wraplength=max(220, width // 3 - 42))
+            if self._welcome_configure_after_id is not None:
+                window.after_cancel(self._welcome_configure_after_id)
+            target_height = max(540, int(width * 9 / 16))
+            if abs(target_height - height) > 4:
+                self._welcome_configure_after_id = window.after(
+                    120,
+                    lambda: window.geometry(f"{width}x{target_height}"),
+                )
+
+        window.bind("<Configure>", on_configure)
+        window.bind("<Escape>", lambda _event: close())
+        window._dyingaudio_refresh = lambda: (redraw(), render_background(window.winfo_width(), window.winfo_height()))
+        redraw()
+        self._center_child_window(window, 1280, 720)
+        render_background(1280, 720)
+        window.lift()
 
     def _refresh_tree(self) -> None:
         selected_index = self._selected_index()
@@ -2317,9 +3190,17 @@ class DyingAudioApp(tk.Tk):
         self.global_speech_intensity_scale_var.set(settings.dl1.speech_intensity)
         settings.dl1.last_output_folder = str(self.last_built_mod_root or "")
         if self.experimental_frame is not None:
+            self.experimental_frame._game_roots[DL2_GAME] = self.dl2_root_var.get().strip()
+            self.experimental_frame._game_roots[DLTB_GAME] = self.dltb_root_var.get().strip()
             settings.experimental = self.experimental_frame.build_settings()
+            settings.experimental.dl2_root = self.dl2_root_var.get().strip()
+            settings.experimental.dltb_root = self.dltb_root_var.get().strip()
+            settings.experimental.cache_root = self.experimental_cache_root_var.get().strip() or DEFAULT_EXPERIMENTAL_CACHE_ROOT
         if self.other_frame is not None:
             settings.other = self.other_frame.build_settings()
+            settings.other.root = self.other_root_var.get().strip()
+            settings.other.cache_root = self.other_cache_root_var.get().strip() or DEFAULT_OTHER_CACHE_ROOT
+        settings.tools = self._tool_settings_snapshot()
         save_settings(settings)
 
     def _build_mod(self) -> None:

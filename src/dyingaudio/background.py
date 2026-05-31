@@ -69,9 +69,13 @@ class BackgroundTaskRunner:
         self._queue = queue.Queue()
 
         def emit_progress(message: str = "", current: float | None = None, total: float | None = None) -> None:
+            if self._cancel_event.is_set():
+                raise TaskCancelled("Task cancelled by user.")
             self._queue.put(("progress", TaskProgress(message=message, current=current, total=total)))
 
         def emit_log(message: str) -> None:
+            if self._cancel_event.is_set():
+                raise TaskCancelled("Task cancelled by user.")
             self._queue.put(("log", message))
 
         def run() -> None:

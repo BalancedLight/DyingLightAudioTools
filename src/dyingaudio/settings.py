@@ -23,6 +23,9 @@ DEFAULT_EXPERIMENTAL_ARCHIVE_SET = "base"
 DEFAULT_EXPERIMENTAL_CACHE_ROOT = str(Path(os.environ.get("LOCALAPPDATA", "")) / "DyingAudio" / "wwise_cache")
 DEFAULT_OTHER_SOURCE_TYPE = "Wwise PCK (AKPK)"
 DEFAULT_OTHER_CACHE_ROOT = str(Path(os.environ.get("LOCALAPPDATA", "")) / "DyingAudio" / "other_pck_cache")
+DEFAULT_FFMPEG_ROOT = ""
+DEFAULT_VGMSTREAM_ROOT = ""
+DEFAULT_WWISE_ROOT = ""
 STEAM_COMMON_SUBPATH = Path("steamapps") / "common"
 GAME_INSTALL_NAMES = {
     "DL1": "Dying Light",
@@ -93,10 +96,20 @@ class OtherSettings:
 
 
 @dataclass(slots=True)
+class ToolSettings:
+    ffmpeg_root: str = DEFAULT_FFMPEG_ROOT
+    vgmstream_root: str = DEFAULT_VGMSTREAM_ROOT
+    wwise_root: str = DEFAULT_WWISE_ROOT
+    show_welcome_on_startup: bool = True
+    high_contrast_mode: bool = False
+
+
+@dataclass(slots=True)
 class AppSettings:
     dl1: DL1Settings = field(default_factory=DL1Settings)
     experimental: ExperimentalSettings = field(default_factory=ExperimentalSettings)
     other: OtherSettings = field(default_factory=OtherSettings)
+    tools: ToolSettings = field(default_factory=ToolSettings)
 
     # Compatibility accessors for the existing DL1 workspace.
     @property
@@ -304,6 +317,8 @@ def load_settings() -> AppSettings:
         settings.experimental = _update_dataclass(settings.experimental, payload["experimental"])
     if isinstance(payload.get("other"), dict):
         settings.other = _update_dataclass(settings.other, payload["other"])
+    if isinstance(payload.get("tools"), dict):
+        settings.tools = _update_dataclass(settings.tools, payload["tools"])
 
     if not settings.dl1.audio_proc_names:
         settings.dl1.audio_proc_names = list(DEFAULT_AUDIO_PROCS)

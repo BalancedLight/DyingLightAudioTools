@@ -58,6 +58,7 @@ from dyingaudio.settings import (
     discover_game_root,
     is_windows_dark_mode,
 )
+from dyingaudio.ui_theme import dark_palette, high_contrast_palette, style_scrolled_text
 
 
 MEDIA_SORT_FIELDS = (
@@ -240,6 +241,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
         self.loading_progress: ttk.Progressbar | None = None
+        self.loading_cancel_button: ttk.Button | None = None
         self.loading_gif_label: ttk.Label | None = None
         self._loading_gif_cache: dict[int, tk.PhotoImage] = {}
         self._loading_gif_frame_count: int | None = None
@@ -257,6 +259,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         self._build_ui()
+        self.apply_theme()
         self._refresh_archive_set_choices()
 
         self.game_var.trace_add("write", self._on_game_changed)
@@ -288,7 +291,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.preview_player.close()
 
     def _build_ui(self) -> None:
-        controls = ttk.LabelFrame(self, text="Experimental Workspace")
+        controls = ttk.LabelFrame(self, text="Dying Light 2 / The Beast Workspace")
         controls.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
         for column in range(9):
             controls.columnconfigure(column, weight=1)
@@ -319,8 +322,6 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.cache_root_browse_button.grid(row=1, column=6, sticky="ew", padx=6, pady=6)
         self.build_workspace_button = ttk.Button(controls, text="Build / Refresh Workspace", command=self._build_workspace)
         self.build_workspace_button.grid(row=1, column=7, sticky="ew", padx=6, pady=6)
-        self.cancel_task_button = ttk.Button(controls, text="Cancel", command=self._cancel_task, state="disabled")
-        self.cancel_task_button.grid(row=1, column=8, sticky="ew", padx=6, pady=6)
 
         ttk.Label(controls, textvariable=self.workspace_var).grid(row=2, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 4))
         ttk.Label(controls, textvariable=self.preview_tools_var).grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
@@ -505,6 +506,19 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.bind("<Configure>", self._on_frame_configure)
         self.bind("<Visibility>", self._on_frame_configure, add="+")
 
+    def apply_theme(self, *, high_contrast: bool | None = None) -> None:
+        if high_contrast is None:
+            high_contrast_var = getattr(self.app, "high_contrast_var", None)
+            high_contrast = bool(high_contrast_var.get()) if high_contrast_var is not None else False
+        if high_contrast:
+            palette = high_contrast_palette()
+        elif is_windows_dark_mode():
+            palette = dark_palette()
+        else:
+            return
+        for widget in (self.details_text, self.logs_text):
+            style_scrolled_text(widget, palette)
+
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
 
@@ -631,6 +645,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         container.rowconfigure(0, weight=0)
         container.rowconfigure(1, weight=1)
         container.rowconfigure(2, weight=0)
+        container.rowconfigure(3, weight=0)
 
         status_frame = ttk.Frame(container, height=68)
         status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -649,10 +664,13 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
         progress = ttk.Progressbar(container, maximum=100, variable=self.task_progress_var)
         progress.grid(row=2, column=0, sticky="ew")
+        cancel_button = ttk.Button(container, text="Cancel", command=self._cancel_task)
+        cancel_button.grid(row=3, column=0, sticky="e", pady=(14, 0))
 
         self.loading_window = window
         self.loading_status_label = status_label
         self.loading_progress = progress
+        self.loading_cancel_button = cancel_button
         self.loading_gif_label = gif_label
         self.task_status_var.set(message)
 
@@ -688,6 +706,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.loading_window = None
         self.loading_status_label = None
         self.loading_progress = None
+        self.loading_cancel_button = None
         self.loading_gif_label = None
 
     def _on_frame_configure(self, _event: object) -> None:
@@ -721,7 +740,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def _set_task_busy(self, busy: bool) -> None:
         for widget in self._busy_widgets:
             widget.configure(state="disabled" if busy else "normal")
-        self.cancel_task_button.configure(state="normal" if busy else "disabled")
+        if self.loading_cancel_button is not None:
+            self.loading_cancel_button.configure(state="normal" if busy else "disabled")
         self.archive_set_combo.configure(state="disabled" if busy else "readonly")
 
     def _apply_task_progress(self, progress: TaskProgress) -> None:
@@ -750,6 +770,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
             return
         self.task_status_var.set("Cancelling task...")
         self._append_status("Cancelling experimental task...")
+        if self.loading_cancel_button is not None:
+            self.loading_cancel_button.configure(state="disabled")
         self.task_runner.cancel()
 
     def _run_task(

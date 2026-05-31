@@ -42,6 +42,7 @@ from dyingaudio.settings import (
     bundled_resource_root,
     is_windows_dark_mode,
 )
+from dyingaudio.ui_theme import dark_palette, high_contrast_palette, style_scrolled_text
 
 
 MEDIA_SORT_FIELDS = (
@@ -193,6 +194,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
         self.loading_progress: ttk.Progressbar | None = None
+        self.loading_cancel_button: ttk.Button | None = None
         self.loading_gif_label: ttk.Label | None = None
         self._loading_gif_cache: dict[int, tk.PhotoImage] = {}
         self._loading_gif_frame_count: int | None = None
@@ -231,6 +233,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         self._build_ui()
+        self.apply_theme()
 
         self.source_type_var.trace_add("write", self._on_source_type_changed)
         self.media_search_var.trace_add("write", self._on_media_filter_changed)
@@ -300,8 +303,6 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.cache_root_browse_button.grid(row=1, column=4, sticky="ew", padx=6, pady=6)
         self.build_workspace_button = ttk.Button(controls, text="Build / Refresh Workspace", command=self._build_workspace)
         self.build_workspace_button.grid(row=1, column=5, sticky="ew", padx=6, pady=6)
-        self.cancel_task_button = ttk.Button(controls, text="Cancel", command=self._cancel_task, state="disabled")
-        self.cancel_task_button.grid(row=1, column=6, sticky="ew", padx=6, pady=6)
 
         self.enable_replace_audio_checkbutton = ttk.Checkbutton(
             controls,
@@ -479,6 +480,19 @@ class OtherWorkspaceFrame(ttk.Frame):
         self._pane_layout_after_ids.append(self.after(500, self._ensure_default_pane_layout))
         self.bind("<Configure>", self._on_frame_configure)
         self.bind("<Visibility>", self._on_frame_configure, add="+")
+
+    def apply_theme(self, *, high_contrast: bool | None = None) -> None:
+        if high_contrast is None:
+            high_contrast_var = getattr(self.app, "high_contrast_var", None)
+            high_contrast = bool(high_contrast_var.get()) if high_contrast_var is not None else False
+        if high_contrast:
+            palette = high_contrast_palette()
+        elif is_windows_dark_mode():
+            palette = dark_palette()
+        else:
+            return
+        for widget in (self.details_text, self.logs_text):
+            style_scrolled_text(widget, palette)
 
     def _append_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -753,6 +767,7 @@ class OtherWorkspaceFrame(ttk.Frame):
         container.rowconfigure(0, weight=0)
         container.rowconfigure(1, weight=1)
         container.rowconfigure(2, weight=0)
+        container.rowconfigure(3, weight=0)
 
         status_frame = ttk.Frame(container, height=68)
         status_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -771,10 +786,13 @@ class OtherWorkspaceFrame(ttk.Frame):
 
         progress = ttk.Progressbar(container, maximum=100, variable=self.task_progress_var)
         progress.grid(row=2, column=0, sticky="ew")
+        cancel_button = ttk.Button(container, text="Cancel", command=self._cancel_task)
+        cancel_button.grid(row=3, column=0, sticky="e", pady=(14, 0))
 
         self.loading_window = window
         self.loading_status_label = status_label
         self.loading_progress = progress
+        self.loading_cancel_button = cancel_button
         self.loading_gif_label = gif_label
         self.task_status_var.set(message)
 
@@ -814,13 +832,15 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.loading_window = None
         self.loading_status_label = None
         self.loading_progress = None
+        self.loading_cancel_button = None
         self.loading_gif_label = None
 
     def _set_task_busy(self, busy: bool) -> None:
         self._ui_busy = busy
         for widget in self._busy_widgets:
             widget.configure(state="disabled" if busy else "normal")
-        self.cancel_task_button.configure(state="normal" if busy else "disabled")
+        if self.loading_cancel_button is not None:
+            self.loading_cancel_button.configure(state="normal" if busy else "disabled")
         self.source_type_combo.configure(state="disabled" if busy else "readonly")
         self.media_sort_combo.configure(state="disabled" if busy else "readonly")
         self._update_replace_controls()
@@ -875,6 +895,8 @@ class OtherWorkspaceFrame(ttk.Frame):
             return
         self.task_status_var.set("Cancelling task...")
         self._append_status("Cancelling Other task...")
+        if self.loading_cancel_button is not None:
+            self.loading_cancel_button.configure(state="disabled")
         self.task_runner.cancel()
 
     def _run_task(
