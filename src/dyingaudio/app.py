@@ -7,6 +7,7 @@ import tempfile
 import traceback
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, ttk
@@ -80,6 +81,8 @@ DL1_SOURCE_FILETYPES = [
 SPEECH_INTENSITY_MIN = 0.0
 SPEECH_INTENSITY_MAX = 2.0
 DEFAULT_SPEECH_INTENSITY = 1.0
+MIXED_DETAIL_VALUE = "[mixed]"
+GITHUB_REPOSITORY_URL = "https://github.com/BalancedLight/DyingLightAudioTools/wiki"
 
 
 def _is_fsb_source(path: str | Path) -> bool:
@@ -186,6 +189,8 @@ class DyingAudioApp(tk.Tk):
         self._detail_form_loading = False
         self._detail_form_dirty = False
         self._detail_entry_index: int | None = None
+        self._detail_entry_indices: tuple[int, ...] = ()
+        self._detail_snapshot: dict[str, str] = {}
         self._suspend_tree_select = False
         self._preview_after_id: str | None = None
         self._preview_started_at: float | None = None
@@ -616,8 +621,9 @@ class DyingAudioApp(tk.Tk):
 
         help_menu = tk.Menu(menubar, tearoff=False)
         self._menus.append(help_menu)
+        help_menu.add_command(label="Open Wiki", command=self._open_github_page)
+        help_menu.add_separator()
         help_menu.add_command(label="Tool Status...", command=self._show_tool_status_window)
-        # help_menu.add_command(label="Welcome Guide...", command=lambda: self._show_welcome_wizard(force=True))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         for menu in self._menus:
@@ -631,15 +637,16 @@ class DyingAudioApp(tk.Tk):
         selected = self.notebook.select() if hasattr(self, "notebook") else ""
         selected_widget = self.nametowidget(selected) if selected else None
         if selected_widget is self.dl1_tab:
-            self.file_menu.add_command(label="Open CSB For Edit...", command=self._open_csb_for_editing)
-            self.file_menu.add_command(label="Save CSB File...", command=self._save_csb_file)
-            self.file_menu.add_command(label="Extract CSB...", command=self._extract_csb)
-            self.file_menu.add_command(label="Inspect CSB...", command=self._inspect_csb)
+            self.file_menu.add_command(label="New empty CSB", command=self._new_empty_csb)
+            self.file_menu.add_command(label="Open CSB", command=self._open_csb_for_editing)
+            self.file_menu.add_command(label="Save CSB", command=self._save_csb_file)
+            self.file_menu.add_command(label="Extract CSB", command=self._extract_csb)
+            self.file_menu.add_command(label="Inspect CSB", command=self._inspect_csb)
             self.file_menu.add_separator()
-            self.file_menu.add_command(label="Add Audio / FSB...", command=self._add_source_files)
-            self.file_menu.add_command(label="Import Manifest...", command=self._import_manifest)
+            self.file_menu.add_command(label="Add Audio / FSB", command=self._add_source_files)
+            self.file_menu.add_command(label="Import Manifest", command=self._import_manifest)
             self.file_menu.add_separator()
-            self.file_menu.add_command(label="Clear DL1 Cache...", command=self._clear_dl1_cache)
+            self.file_menu.add_command(label="Clear DL1 Cache", command=self._clear_dl1_cache)
         elif selected_widget is self.experimental_frame and self.experimental_frame is not None:
             workspace = self.experimental_frame
             self.file_menu.add_command(label="Build / Refresh Workspace", command=workspace._build_workspace)
@@ -853,7 +860,7 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(filter_bar, textvariable=self.entry_count_var).grid(row=0, column=6, sticky="e")
 
         columns = ("name", "mode", "source", "type", "duration", "samples")
-        self.tree = ttk.Treeview(entries_frame, columns=columns, show="headings", height=14)
+        self.tree = ttk.Treeview(entries_frame, columns=columns, show="headings", height=14, selectmode="extended")
         self.tree.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Button-3>", self._show_tree_context_menu)
@@ -1061,11 +1068,13 @@ class DyingAudioApp(tk.Tk):
         self._detail_form_dirty = True
         self._update_selected_entry_controls()
 
-    def _populate_selected_entry_details(self, index: int | None) -> None:
+    def _populate_selected_entry_details(self, indices: int | list[int] | tuple[int, ...] | None) -> None:
+        normalized = self._normalize_selection_indices(indices)
         self._detail_form_loading = True
         try:
-            self._detail_entry_index = index
-            if index is None:
+            self._detail_entry_indices = normalized
+            self._detail_entry_index = normalized[0] if normalized else None
+            if not normalized:
                 self.selected_name_var.set("")
                 self.selected_type_var.set("2")
                 self.selected_sample_count_var.set("0")
@@ -1075,8 +1084,8 @@ class DyingAudioApp(tk.Tk):
                 self.selected_source_var.set("")
                 self.selected_fsb_var.set("")
                 self.selected_notes_var.set("")
-            else:
-                entry = self.entries[index]
+            elif len(normalized) == 1:
+                entry = self.entries[normalized[0]]
                 self.selected_name_var.set(entry.entry_name)
                 self.selected_type_var.set(str(entry.entry_type))
                 self.selected_sample_count_var.set(str(entry.sample_count))
@@ -1086,13 +1095,30 @@ class DyingAudioApp(tk.Tk):
                 self.selected_source_var.set(entry.source_path)
                 self.selected_fsb_var.set(entry.fsb_path)
                 self.selected_notes_var.set(entry.notes)
+            else:
+                entries = [self.entries[index] for index in normalized]
+                self.selected_name_var.set(MIXED_DETAIL_VALUE)
+                self.selected_type_var.set(self._detail_display_value([entry.entry_type for entry in entries]))
+                self.selected_sample_count_var.set(self._detail_display_value([entry.sample_count for entry in entries]))
+                self.selected_duration_var.set(self._detail_display_value([entry.duration_ms for entry in entries]))
+                self.selected_speech_intensity_var.set(
+                    self._detail_display_value(
+                        [entry.speech_intensity for entry in entries],
+                        formatter=lambda value: _format_speech_intensity(float(value)),
+                    )
+                )
+                self.selected_speech_intensity_scale_var.set(_clamp_speech_intensity(entries[0].speech_intensity))
+                self.selected_source_var.set(self._detail_display_value([entry.source_path for entry in entries]))
+                self.selected_fsb_var.set(self._detail_display_value([entry.fsb_path for entry in entries]))
+                self.selected_notes_var.set(self._detail_display_value([entry.notes for entry in entries]))
         finally:
             self._detail_form_loading = False
         self._detail_form_dirty = False
+        self._detail_snapshot = self._detail_values()
         self._update_selected_entry_controls()
 
     def _update_selected_entry_controls(self) -> None:
-        has_selection = self._detail_entry_index is not None
+        has_selection = bool(self._detail_entry_indices)
         entry_state = "normal" if has_selection else "disabled"
         for widget in (
             self.selected_name_entry,
@@ -1159,14 +1185,71 @@ class DyingAudioApp(tk.Tk):
     def _clear_suspended_tree_select(self) -> None:
         self._suspend_tree_select = False
 
-    def _restore_tree_selection(self, index: int | None) -> None:
-        if index is None or str(index) not in self.tree.get_children():
+    def _normalize_selection_indices(self, indices: int | list[int] | tuple[int, ...] | None) -> tuple[int, ...]:
+        if indices is None:
+            return ()
+        if isinstance(indices, int):
+            return (indices,)
+        return tuple(sorted(dict.fromkeys(int(index) for index in indices)))
+
+    def _set_tree_selection(self, indices: int | list[int] | tuple[int, ...]) -> None:
+        normalized = self._normalize_selection_indices(indices)
+        children = set(self.tree.get_children())
+        valid = [str(index) for index in normalized if str(index) in children]
+        if not valid:
             return
         self._suspend_tree_select = True
-        self.tree.selection_set(str(index))
-        self.tree.focus(str(index))
-        self.tree.see(str(index))
+        current_selection = tuple(self.tree.selection())
+        if current_selection and hasattr(self.tree, "selection_remove"):
+            self.tree.selection_remove(*current_selection)
+        first = valid[0]
+        self.tree.selection_set(first)
+        if len(valid) > 1:
+            if hasattr(self.tree, "selection_add"):
+                for iid in valid[1:]:
+                    self.tree.selection_add(iid)
+            else:
+                self.tree.selection_set(tuple(valid))
+        self.tree.focus(first)
+        self.tree.see(first)
         self.after_idle(self._clear_suspended_tree_select)
+
+    def _restore_tree_selection(self, indices: int | list[int] | tuple[int, ...] | None) -> None:
+        normalized = self._normalize_selection_indices(indices)
+        if not normalized:
+            return
+        self._set_tree_selection(normalized)
+
+    def _detail_values(self) -> dict[str, str]:
+        return {
+            "name": self.selected_name_var.get(),
+            "type": self.selected_type_var.get(),
+            "samples": self.selected_sample_count_var.get(),
+            "duration": self.selected_duration_var.get(),
+            "speech": self.selected_speech_intensity_var.get(),
+        }
+
+    def _detail_display_value(
+        self,
+        values: list[object],
+        *,
+        formatter: Callable[[object], str] | None = None,
+        always_mixed_when_multiple: bool = False,
+    ) -> str:
+        if not values:
+            return ""
+        if len(values) > 1 and always_mixed_when_multiple:
+            return MIXED_DETAIL_VALUE
+        format_value = formatter or (lambda value: str(value))
+        formatted = [format_value(value) for value in values]
+        first = formatted[0]
+        return first if all(value == first for value in formatted[1:]) else MIXED_DETAIL_VALUE
+
+    def _selected_indices(self) -> list[int]:
+        selected = self.tree.selection()
+        if not selected:
+            return []
+        return sorted(int(iid) for iid in selected)
 
     def _update_sort_controls(self) -> None:
         is_manual_order = self.sort_field_var.get().strip() == "Original Order"
@@ -1181,6 +1264,12 @@ class DyingAudioApp(tk.Tk):
         if tab is None:
             return
         self.notebook.select(tab)
+
+    def _open_github_page(self) -> None:
+        if webbrowser.open(GITHUB_REPOSITORY_URL, new=2):
+            self.status_var.set("Opened GitHub page.")
+            return
+        self._show_error_window("Open GitHub page", f"Could not open:\n{GITHUB_REPOSITORY_URL}")
 
     def _show_console_panel(self) -> None:
         if self.console_frame is None:
@@ -1677,19 +1766,22 @@ class DyingAudioApp(tk.Tk):
         self._apply_selected_entry()
         return "break"
 
-    def _select_entry(self, index: int) -> None:
-        if index < 0 or index >= len(self.entries):
+    def _select_entries(self, indices: int | list[int] | tuple[int, ...]) -> None:
+        normalized = self._normalize_selection_indices(indices)
+        if not normalized:
             return
-        iid = str(index)
-        if iid not in self.tree.get_children():
-            visible_indices = self._visible_entry_indices()
+        visible_indices = self._visible_entry_indices()
+        visible_index_set = set(visible_indices)
+        visible_selection = [index for index in normalized if index in visible_index_set]
+        if not visible_selection:
             if not visible_indices:
                 return
-            iid = str(visible_indices[0])
-        self.tree.selection_set(iid)
-        self.tree.focus(iid)
-        self.tree.see(iid)
+            visible_selection = [visible_indices[0]]
+        self._set_tree_selection(visible_selection)
         self._on_tree_select(None)
+
+    def _select_entry(self, index: int) -> None:
+        self._select_entries((index,))
 
     def _set_loaded_csb(self, path: str | Path | None) -> None:
         self.loaded_csb_path = Path(path).resolve() if path else None
@@ -1717,11 +1809,18 @@ class DyingAudioApp(tk.Tk):
         return f"magic 0x{magic:08X}"
 
     def _update_preview_info(self) -> None:
-        index = self._selected_index()
-        if index is None:
+        indices = self._selected_indices()
+        if not indices:
             self.preview_info_var.set("Select an entry to preview it.")
             return
-        self.preview_info_var.set(preview_strategy_for_entry(self.entries[index], self.preview_player.environment))
+        if len(indices) > 1:
+            first_entry = self.entries[indices[0]]
+            self.preview_info_var.set(
+                f"{len(indices)} entries selected. Preview uses '{first_entry.entry_name}'. "
+                f"{preview_strategy_for_entry(first_entry, self.preview_player.environment)}"
+            )
+            return
+        self.preview_info_var.set(preview_strategy_for_entry(self.entries[indices[0]], self.preview_player.environment))
 
     def _cleanup_edit_session(self) -> None:
         if self.edit_session_dir is not None:
@@ -2013,7 +2112,7 @@ class DyingAudioApp(tk.Tk):
         window.transient(self)
         window.geometry("1280x720")
         window.minsize(960, 540)
-        window.resizable(True, True)
+        window.resizable(False, False)
         window.configure(bg="#000000")
         window.protocol("WM_DELETE_WINDOW", window.destroy)
 
@@ -2021,17 +2120,7 @@ class DyingAudioApp(tk.Tk):
         canvas.pack(fill="both", expand=True)
         landing_path = bundled_resource_root() / "assets" / "Landing.png"
         landing_image: tk.PhotoImage | None = None
-        pil_image = None
-        image_tk_module = None
         background_item = canvas.create_image(0, 0, anchor="nw")
-        try:
-            from PIL import Image, ImageTk
-
-            pil_image = Image.open(landing_path) if landing_path.exists() else None
-            image_tk_module = ImageTk
-        except (ImportError, OSError):
-            pil_image = None
-            image_tk_module = None
         if landing_path.exists():
             try:
                 landing_image = tk.PhotoImage(master=window, file=str(landing_path))
@@ -2046,11 +2135,7 @@ class DyingAudioApp(tk.Tk):
                 canvas.configure(bg="#000000")
                 canvas.itemconfigure(background_item, image="")
                 return
-            if pil_image is not None and image_tk_module is not None:
-                resized = pil_image.resize((width, height))
-                self._welcome_background_image = image_tk_module.PhotoImage(resized)
-                canvas.itemconfigure(background_item, image=self._welcome_background_image, anchor="nw")
-            elif landing_image is not None:
+            if landing_image is not None:
                 canvas.itemconfigure(background_item, image=landing_image, anchor="nw")
             else:
                 canvas.itemconfigure(background_item, image="")
@@ -2330,7 +2415,7 @@ class DyingAudioApp(tk.Tk):
         window.lift()
 
     def _refresh_tree(self) -> None:
-        selected_index = self._selected_index()
+        selected_indices = self._selected_indices()
         self.tree.delete(*self.tree.get_children())
         visible_indices = self._visible_entry_indices()
         for index in visible_indices:
@@ -2349,13 +2434,11 @@ class DyingAudioApp(tk.Tk):
                 ),
             )
         self.entry_count_var.set(f"{len(visible_indices)} shown / {len(self.entries)} total")
-        if selected_index is not None and str(selected_index) in self.tree.get_children():
-            self.tree.selection_set(str(selected_index))
-            self.tree.focus(str(selected_index))
-            self.tree.see(str(selected_index))
+        visible_selection = [index for index in selected_indices if str(index) in self.tree.get_children()]
+        if visible_selection:
+            self._set_tree_selection(visible_selection)
         elif visible_indices:
-            self.tree.selection_set(str(visible_indices[0]))
-            self.tree.focus(str(visible_indices[0]))
+            self._set_tree_selection((visible_indices[0],))
         self._on_tree_select(None)
 
     def _visible_entry_indices(self) -> list[int]:
@@ -2386,10 +2469,10 @@ class DyingAudioApp(tk.Tk):
         return [index for index, _entry in indexed_entries]
 
     def _selected_index(self) -> int | None:
-        selected = self.tree.selection()
-        if not selected:
+        selected_indices = self._selected_indices()
+        if not selected_indices:
             return None
-        return int(selected[0])
+        return selected_indices[0]
 
     def _selected_entry(self) -> AudioEntry | None:
         index = self._selected_index()
@@ -2397,21 +2480,27 @@ class DyingAudioApp(tk.Tk):
             return None
         return self.entries[index]
 
+    def _selected_entries(self) -> list[AudioEntry]:
+        return [self.entries[index] for index in self._selected_indices() if 0 <= index < len(self.entries)]
+
     def _on_tree_select(self, _event: object) -> None:
         if self._suspend_tree_select:
             self._suspend_tree_select = False
             return
 
-        index = self._selected_index()
+        selected_indices = tuple(self._selected_indices())
+        current_indices = self._detail_entry_indices
         current_index = self._detail_entry_index
-        if self._detail_form_dirty and current_index != index:
-            current_name = "current entry"
-            if current_index is not None and 0 <= current_index < len(self.entries):
-                current_name = self.entries[current_index].entry_name
+        if self._detail_form_dirty and current_indices != selected_indices:
+            current_name = "the current selection"
+            if len(current_indices) == 1 and current_index is not None and 0 <= current_index < len(self.entries):
+                current_name = f"'{self.entries[current_index].entry_name}'"
+            elif current_indices:
+                current_name = f"the {len(current_indices)} selected entries"
             choice = self._ask_yes_no_cancel_window(
                 "Unsaved entry changes",
                 (
-                    f"Apply changes to '{current_name}' before switching selection?\n\n"
+                    f"Apply changes to {current_name} before switching selection?\n\n"
                     "Yes = apply changes\n"
                     "No = discard changes\n"
                     "Cancel = keep the current selection"
@@ -2419,20 +2508,20 @@ class DyingAudioApp(tk.Tk):
                 kind="question",
             )
             if choice is None:
-                self._restore_tree_selection(current_index)
+                self._restore_tree_selection(current_indices)
                 return
             if choice:
-                if not self._apply_selected_entry(target_index=current_index):
-                    self._restore_tree_selection(current_index)
+                if not self._apply_selected_entry(target_indices=current_indices):
+                    self._restore_tree_selection(current_indices)
                 return
             self._detail_form_dirty = False
 
-        if index == current_index and self._detail_form_dirty:
+        if selected_indices == current_indices and self._detail_form_dirty:
             self._update_selected_entry_controls()
             self._update_preview_info()
             return
 
-        self._populate_selected_entry_details(index)
+        self._populate_selected_entry_details(selected_indices)
         self._update_preview_info()
 
     def _show_tree_context_menu(self, event: object) -> str | None:
@@ -2440,16 +2529,17 @@ class DyingAudioApp(tk.Tk):
             return None
 
         row_id = self.tree.identify_row(event.y)
-        if row_id:
+        selected_rows = set(self.tree.selection())
+        if row_id and row_id not in selected_rows:
             self.tree.selection_set(row_id)
             self.tree.focus(row_id)
             self._on_tree_select(None)
 
-        selected_entry = self._selected_entry()
-        has_selection = selected_entry is not None
+        selected_entries = self._selected_entries()
+        has_selection = bool(selected_entries)
         can_export_audio = has_selection
         can_export_fsb = has_selection and (
-            selected_entry.source_mode == "fsb" or self.current_toolchain is not None
+            self.current_toolchain is not None or all(entry.source_mode == "fsb" for entry in selected_entries)
         )
 
         self.entry_context_menu.entryconfigure("Replace Audio / FSB...", state="normal" if has_selection else "disabled")
@@ -2464,19 +2554,45 @@ class DyingAudioApp(tk.Tk):
             self.entry_context_menu.grab_release()
         return "break"
 
-    def _apply_selected_entry(self, *, target_index: int | None = None) -> bool:
-        index = self._detail_entry_index if target_index is None else target_index
-        if index is None:
+    def _apply_bulk_entry_name(self, indices: tuple[int, ...], base_name: str) -> list[str]:
+        width = max(2, len(str(max(0, len(indices) - 1))))
+        renamed: list[str] = []
+        for offset, index in enumerate(indices):
+            name = base_name if len(indices) == 1 else f"{base_name}_{offset:0{width}d}"
+            self.entries[index].entry_name = name
+            renamed.append(name)
+        return renamed
+
+    def _apply_selected_entry(self, *, target_indices: int | list[int] | tuple[int, ...] | None = None) -> bool:
+        indices = self._normalize_selection_indices(self._detail_entry_indices if target_indices is None else target_indices)
+        if not indices:
             return True
+        displayed_values = self._detail_values()
+        changed_fields = {
+            key: displayed_values[key] != self._detail_snapshot.get(key, displayed_values[key]) for key in displayed_values
+        }
+        if not any(changed_fields.values()):
+            self._detail_form_dirty = False
+            self._update_selected_entry_controls()
+            return True
+        is_multi_selection = len(indices) > 1
 
         try:
-            entry_type = int(self.selected_type_var.get() or 2)
-            sample_count = int(self.selected_sample_count_var.get() or 0)
-            duration_ms = int(self.selected_duration_var.get() or 0)
-            speech_intensity = self._parse_speech_intensity(
-                self.selected_speech_intensity_var.get(),
-                field_name="Speech intensity",
-            )
+            entry_type = None
+            sample_count = None
+            duration_ms = None
+            speech_intensity = None
+            if not is_multi_selection or changed_fields["type"]:
+                entry_type = int(self.selected_type_var.get() or 2)
+            if not is_multi_selection or changed_fields["samples"]:
+                sample_count = int(self.selected_sample_count_var.get() or 0)
+            if not is_multi_selection or changed_fields["duration"]:
+                duration_ms = int(self.selected_duration_var.get() or 0)
+            if not is_multi_selection or changed_fields["speech"]:
+                speech_intensity = self._parse_speech_intensity(
+                    self.selected_speech_intensity_var.get(),
+                    field_name="Speech intensity",
+                )
         except ValueError:
             self._show_error_window(
                 "Invalid entry values",
@@ -2484,24 +2600,40 @@ class DyingAudioApp(tk.Tk):
             )
             self.status_var.set("Entry update failed.")
             return False
-        if entry_type <= 0:
+        if entry_type is not None and entry_type <= 0:
             self._show_error_window("Invalid entry values", "Type must be 1, 2, or another positive channel count.")
             self.status_var.set("Entry update failed.")
             return False
-        if sample_count < 0 or duration_ms < 0:
+        if (sample_count is not None and sample_count < 0) or (duration_ms is not None and duration_ms < 0):
             self._show_error_window("Invalid entry values", "Samples @ 48k and Duration (ms) cannot be negative.")
             self.status_var.set("Entry update failed.")
             return False
 
-        entry = self.entries[index]
-        entry.entry_name = self.selected_name_var.get().strip() or entry.entry_name
-        entry.entry_type = entry_type
-        entry.sample_count = sample_count
-        entry.duration_ms = duration_ms
-        entry.speech_intensity = speech_intensity
+        renamed_entries: list[str] = []
+        if changed_fields["name"]:
+            base_name = self.selected_name_var.get().strip()
+            if base_name:
+                renamed_entries = self._apply_bulk_entry_name(indices, base_name)
+
+        for index in indices:
+            entry = self.entries[index]
+            if entry_type is not None:
+                entry.entry_type = entry_type
+            if sample_count is not None:
+                entry.sample_count = sample_count
+            if duration_ms is not None:
+                entry.duration_ms = duration_ms
+            if speech_intensity is not None:
+                entry.speech_intensity = speech_intensity
+
         self._detail_form_dirty = False
         self._refresh_tree()
-        self.status_var.set(f"Updated entry '{entry.entry_name}'.")
+        if len(indices) == 1:
+            self.status_var.set(f"Updated entry '{self.entries[indices[0]].entry_name}'.")
+        elif renamed_entries:
+            self.status_var.set(f"Updated {len(indices)} entries with base name '{self.selected_name_var.get().strip()}'.")
+        else:
+            self.status_var.set(f"Updated {len(indices)} entries.")
         return True
 
     def _build_entry_from_source_file(self, selection: str) -> tuple[AudioEntry, str]:
@@ -2615,9 +2747,26 @@ class DyingAudioApp(tk.Tk):
             self._warn_if_raw_entries_need_toolchain()
         self.status_var.set(f"Imported {len(imported)} entry/entries from manifest.")
 
+    def _new_empty_csb(self) -> None:
+        if not self._apply_selected_entry():
+            return
+        if self.entries and not self._ask_yes_no_window("New empty CSB", "Start a new empty CSB and clear the current entries?"):
+            return
+        self.preview_player.stop()
+        self._reset_preview_progress()
+        self.preview_player.clear_cache()
+        self._cleanup_edit_session()
+        self.entries.clear()
+        self._set_loaded_csb(None)
+        self._set_loaded_csb_magic(None)
+        self._set_loaded_csb_layout(None)
+        self._refresh_tree()
+        self._update_preview_info()
+        self.status_var.set("Started a new empty CSB.")
+
     def _open_csb_for_editing(self) -> None:
         selection = filedialog.askopenfilename(
-            title="Open CSB For Editing",
+            title="Open CSB",
             filetypes=[("CSB files", "*.csb"), ("All files", "*.*")],
         )
         if not selection:
@@ -2665,152 +2814,241 @@ class DyingAudioApp(tk.Tk):
         if not self._apply_selected_entry():
             return
 
-        index = self._selected_index()
-        if index is None:
+        indices = tuple(self._selected_indices())
+        if not indices:
             self._show_info_window("Replace audio / FSB", "Select an entry to replace first.")
             return
 
-        selection = filedialog.askopenfilename(title="Replace selected entry with audio or FSB", filetypes=DL1_SOURCE_FILETYPES)
-        if not selection:
+        if len(indices) == 1:
+            selection = filedialog.askopenfilename(title="Replace selected entry with audio or FSB", filetypes=DL1_SOURCE_FILETYPES)
+            selections = (selection,) if selection else ()
+        else:
+            selections = filedialog.askopenfilenames(
+                title="Replace selected entries with audio or FSB",
+                filetypes=DL1_SOURCE_FILETYPES,
+            )
+        if not selections:
+            return
+        if len(selections) != len(indices):
+            self._show_error_window(
+                "Replace audio / FSB",
+                f"Select exactly {len(indices)} replacement file(s) for the current selection.",
+            )
             return
 
+        raw_count = 0
+        fsb_count = 0
         try:
-            source_kind = self._apply_source_file_to_entry(self.entries[index], selection)
+            for index, selection in zip(indices, selections, strict=True):
+                source_kind = self._apply_source_file_to_entry(self.entries[index], selection)
+                if source_kind == "raw":
+                    raw_count += 1
+                else:
+                    fsb_count += 1
         except Exception as exc:
             self._show_error_window("Replace audio / FSB failed", str(exc))
             self.status_var.set("Replace failed.")
             self._append_log(f"ERROR: {exc}")
             return
 
-        entry = self.entries[index]
         self.preview_player.stop()
         self._reset_preview_progress()
-        if source_kind == "raw":
+        if raw_count:
             self._ensure_raw_builder_mode()
             self._warn_if_raw_entries_need_toolchain()
         self._refresh_tree()
-        self._select_entry(index)
-        self.status_var.set(f"Replaced '{entry.entry_name}' with new {'audio' if source_kind == 'raw' else 'FSB'}.")
+        self._select_entries(indices)
+        if len(indices) == 1:
+            entry = self.entries[indices[0]]
+            replacement_label = "audio" if raw_count else "FSB"
+            self.status_var.set(f"Replaced '{entry.entry_name}' with new {replacement_label}.")
+        else:
+            self.status_var.set(f"Replaced {len(indices)} entries with {self._format_source_summary(raw_count, fsb_count)}.")
 
     def _suggest_export_audio_name(self, entry: AudioEntry) -> str:
         return f"{entry.entry_name}{audio_quality_output_suffix(self.audio_quality_var.get())}"
+
+    def _unique_export_destination(self, directory: Path, filename: str, reserved: set[Path]) -> Path:
+        candidate = directory / filename
+        stem = candidate.stem
+        suffix = candidate.suffix
+        counter = 1
+        while candidate in reserved or candidate.exists():
+            candidate = directory / f"{stem}_{counter:02d}{suffix}"
+            counter += 1
+        reserved.add(candidate)
+        return candidate
 
     def _export_selected_audio(self) -> None:
         if not self._apply_selected_entry():
             return
 
-        entry = self._selected_entry()
-        if entry is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             self._show_info_window("Export audio", "Select an entry to export first.")
             return
+        selected_entries = [self.entries[index] for index in selected_indices]
+        multiple = len(selected_entries) > 1
 
-        selection = filedialog.asksaveasfilename(
-            title="Export audio",
-            defaultextension=Path(self._suggest_export_audio_name(entry)).suffix,
-            initialfile=self._suggest_export_audio_name(entry),
-            filetypes=AUDIO_EXPORT_FILETYPES,
-        )
-        if not selection:
-            return
-
-        destination = Path(selection).resolve()
+        if multiple:
+            selection = filedialog.askdirectory(title="Export selected audio")
+            if not selection:
+                return
+            destination_root = Path(selection).resolve()
+        else:
+            entry = selected_entries[0]
+            selection = filedialog.asksaveasfilename(
+                title="Export audio",
+                defaultextension=Path(self._suggest_export_audio_name(entry)).suffix,
+                initialfile=self._suggest_export_audio_name(entry),
+                filetypes=AUDIO_EXPORT_FILETYPES,
+            )
+            if not selection:
+                return
+            destination_root = Path(selection).resolve()
 
         def worker(progress, log):
-            progress(f"Exporting audio for {entry.entry_name}...", 0, 2)
-            source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
-            if source is None or not source.exists():
-                raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
-            progress(f"Converting {entry.entry_name} to {destination.suffix.lower()}...", 1, 2)
-            export_audio_file(
-                source,
-                destination,
-                log=log,
-                audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
-            )
-            progress(f"Copied {destination.name}.", 2, 2)
-            return destination
+            total = len(selected_entries)
+            exported: list[Path] = []
+            reserved_paths: set[Path] = set()
+            for offset, entry in enumerate(selected_entries, start=1):
+                progress(f"Exporting audio for {entry.entry_name}...", offset - 1, total)
+                source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
+                if source is None or not source.exists():
+                    raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
+                destination = (
+                    self._unique_export_destination(destination_root, self._suggest_export_audio_name(entry), reserved_paths)
+                    if multiple
+                    else destination_root
+                )
+                export_audio_file(
+                    source,
+                    destination,
+                    log=log,
+                    audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
+                )
+                exported.append(destination)
+                progress(f"Exported {destination.name}.", offset, total)
+            return exported
+
+        def on_success(result: object) -> None:
+            exported = result
+            if not multiple:
+                self.status_var.set(f"Exported audio for '{selected_entries[0].entry_name}'.")
+            else:
+                self.status_var.set(f"Exported audio for {len(selected_entries)} entries.")
+            for path in exported:
+                self._append_log(f"Exported audio to {path}")
+            self.task_status_var.set("Audio export complete.")
 
         self._run_dl1_task(
-            start_message=f"Exporting audio for '{entry.entry_name}'...",
+            start_message=(
+                f"Exporting audio for '{selected_entries[0].entry_name}'..."
+                if not multiple
+                else f"Exporting audio for {len(selected_entries)} entries..."
+            ),
             error_title="Export audio failed",
             worker=worker,
-            on_success=lambda result: (
-                self.status_var.set(f"Exported audio for '{entry.entry_name}'."),
-                self._append_log(f"Exported audio to {result}"),
-                self.task_status_var.set("Audio export complete."),
-            ),
+            on_success=on_success,
         )
 
     def _export_selected_fsb(self) -> None:
         if not self._apply_selected_entry():
             return
 
-        entry = self._selected_entry()
-        if entry is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             self._show_info_window("Export FSB", "Select an entry to export first.")
             return
+        selected_entries = [self.entries[index] for index in selected_indices]
+        multiple = len(selected_entries) > 1
 
-        selection = filedialog.asksaveasfilename(
-            title="Export FSB",
-            defaultextension=".fsb",
-            initialfile=f"{entry.entry_name}.fsb",
-            filetypes=[("FSB files", "*.fsb"), ("All files", "*.*")],
-        )
-        if not selection:
-            return
-
-        destination = Path(selection).resolve()
+        if multiple:
+            selection = filedialog.askdirectory(title="Export selected FSB files")
+            if not selection:
+                return
+            destination_root = Path(selection).resolve()
+        else:
+            entry = selected_entries[0]
+            selection = filedialog.asksaveasfilename(
+                title="Export FSB",
+                defaultextension=".fsb",
+                initialfile=f"{entry.entry_name}.fsb",
+                filetypes=[("FSB files", "*.fsb"), ("All files", "*.*")],
+            )
+            if not selection:
+                return
+            destination_root = Path(selection).resolve()
 
         def worker(progress, log):
-            progress(f"Exporting FSB for {entry.entry_name}...", 0, 3)
-            if entry.source_mode == "fsb":
-                source = entry.resolved_fsb_path()
-                if source is None or not source.exists():
-                    raise FileNotFoundError(f"Missing FSB file for '{entry.entry_name}'.")
-                shutil.copyfile(source, destination)
-                progress(f"Copied {destination.name}.", 3, 3)
-                return destination
-
-            if self.current_toolchain is None:
-                raise RuntimeError("A valid DLDT toolchain is required to export raw audio as FSB.")
-            with tempfile.TemporaryDirectory(prefix="dyingaudio_export_fsb_") as temp_dir:
-                temp_root = Path(temp_dir)
-                source = entry.resolved_source_path()
-                if source is None or not source.exists():
-                    raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
-                compile_source = source
-                if source.suffix.lower() != ".wav":
-                    media_tools = discover_media_tools()
-                    compile_source = temp_root / f"{entry.entry_name}.wav"
-                    progress(f"Converting {source.name} for FSB export...", 1, 3)
-                    compile_source = decode_audio_to_wav(source, compile_source, log=log, tools=media_tools)
-                progress(f"Compiling {entry.entry_name} to FSB...", 2, 3)
-                compile_result = compile_audio_to_fsb(
-                    self.current_toolchain,
-                    compile_source,
-                    destination,
-                    temp_root / "cache",
-                    audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
+            total = len(selected_entries)
+            exported: list[Path] = []
+            reserved_paths: set[Path] = set()
+            for offset, entry in enumerate(selected_entries, start=1):
+                destination = (
+                    self._unique_export_destination(destination_root, f"{entry.entry_name}.fsb", reserved_paths)
+                    if multiple
+                    else destination_root
                 )
-                log(" ".join(compile_result.command))
-                if compile_result.stdout:
-                    log(compile_result.stdout)
-                if compile_result.stderr:
-                    log(compile_result.stderr)
-                if not compile_result.success:
-                    raise RuntimeError(f"Could not compile '{entry.entry_name}' to FSB.")
-            progress(f"Exported {destination.name}.", 3, 3)
-            return destination
+                progress(f"Exporting FSB for {entry.entry_name}...", offset - 1, total)
+                if entry.source_mode == "fsb":
+                    source = entry.resolved_fsb_path()
+                    if source is None or not source.exists():
+                        raise FileNotFoundError(f"Missing FSB file for '{entry.entry_name}'.")
+                    shutil.copyfile(source, destination)
+                    exported.append(destination)
+                    progress(f"Copied {destination.name}.", offset, total)
+                    continue
+
+                if self.current_toolchain is None:
+                    raise RuntimeError("A valid DLDT toolchain is required to export raw audio as FSB.")
+                with tempfile.TemporaryDirectory(prefix="dyingaudio_export_fsb_") as temp_dir:
+                    temp_root = Path(temp_dir)
+                    source = entry.resolved_source_path()
+                    if source is None or not source.exists():
+                        raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
+                    compile_source = source
+                    if source.suffix.lower() != ".wav":
+                        media_tools = discover_media_tools()
+                        compile_source = temp_root / f"{entry.entry_name}.wav"
+                        compile_source = decode_audio_to_wav(source, compile_source, log=log, tools=media_tools)
+                    compile_result = compile_audio_to_fsb(
+                        self.current_toolchain,
+                        compile_source,
+                        destination,
+                        temp_root / "cache",
+                        audio_quality=self.audio_quality_var.get().strip() or DEFAULT_DL1_AUDIO_QUALITY,
+                    )
+                    log(" ".join(compile_result.command))
+                    if compile_result.stdout:
+                        log(compile_result.stdout)
+                    if compile_result.stderr:
+                        log(compile_result.stderr)
+                    if not compile_result.success:
+                        raise RuntimeError(f"Could not compile '{entry.entry_name}' to FSB.")
+                exported.append(destination)
+                progress(f"Exported {destination.name}.", offset, total)
+            return exported
+
+        def on_success(result: object) -> None:
+            exported = result
+            if not multiple:
+                self.status_var.set(f"Exported FSB for '{selected_entries[0].entry_name}'.")
+            else:
+                self.status_var.set(f"Exported FSB for {len(selected_entries)} entries.")
+            for path in exported:
+                self._append_log(f"Exported FSB to {path}")
+            self.task_status_var.set("FSB export complete.")
 
         self._run_dl1_task(
-            start_message=f"Exporting FSB for '{entry.entry_name}'...",
+            start_message=(
+                f"Exporting FSB for '{selected_entries[0].entry_name}'..."
+                if not multiple
+                else f"Exporting FSB for {len(selected_entries)} entries..."
+            ),
             error_title="Export FSB failed",
             worker=worker,
-            on_success=lambda result: (
-                self.status_var.set(f"Exported FSB for '{entry.entry_name}'."),
-                self._append_log(f"Exported FSB to {result}"),
-                self.task_status_var.set("FSB export complete."),
-            ),
+            on_success=on_success,
         )
 
     def _make_duplicate_name(self, entry_name: str) -> str:
@@ -2827,29 +3065,39 @@ class DyingAudioApp(tk.Tk):
         if not self._apply_selected_entry():
             return
 
-        index = self._selected_index()
-        if index is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             self._show_info_window("Duplicate entry", "Select an entry to duplicate first.")
             return
 
-        source_entry = self.entries[index]
-        duplicate = replace(source_entry, entry_name=self._make_duplicate_name(source_entry.entry_name))
-        self.entries.insert(index + 1, duplicate)
+        original_names = [self.entries[index].entry_name for index in selected_indices]
+        inserted_indices: list[int] = []
+        offset = 0
+        for index in selected_indices:
+            source_entry = self.entries[index + offset]
+            duplicate = replace(source_entry, entry_name=self._make_duplicate_name(source_entry.entry_name))
+            insert_at = index + offset + 1
+            self.entries.insert(insert_at, duplicate)
+            inserted_indices.append(insert_at)
+            offset += 1
         self._refresh_tree()
-        self._select_entry(index + 1)
-        self.status_var.set(f"Duplicated '{source_entry.entry_name}'.")
+        self._select_entries(inserted_indices)
+        if len(selected_indices) == 1:
+            self.status_var.set(f"Duplicated '{original_names[0]}'.")
+        else:
+            self.status_var.set(f"Duplicated {len(selected_indices)} entries.")
 
     def _rename_selected_entry(self) -> None:
         if not self._apply_selected_entry():
             return
 
-        index = self._selected_index()
-        if index is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             self._show_info_window("Rename entry", "Select an entry to rename first.")
             return
 
-        entry = self.entries[index]
-        new_name = self._ask_string_window("Rename entry", "Entry name:", initialvalue=entry.entry_name)
+        initial_name = self.entries[selected_indices[0]].entry_name if len(selected_indices) == 1 else ""
+        new_name = self._ask_string_window("Rename entry", "Entry name:", initialvalue=initial_name)
         if new_name is None:
             return
 
@@ -2858,26 +3106,35 @@ class DyingAudioApp(tk.Tk):
             self._show_error_window("Rename entry", "Entry name cannot be empty.")
             return
 
-        entry.entry_name = cleaned_name
+        self._apply_bulk_entry_name(selected_indices, cleaned_name)
         self._refresh_tree()
-        self._select_entry(index)
-        self.status_var.set(f"Renamed entry to '{cleaned_name}'.")
+        self._select_entries(selected_indices)
+        if len(selected_indices) == 1:
+            self.status_var.set(f"Renamed entry to '{cleaned_name}'.")
+        else:
+            self.status_var.set(f"Renamed {len(selected_indices)} entries to '{cleaned_name}_XX'.")
 
     def _remove_selected(self) -> None:
         if not self._apply_selected_entry():
             return
-        index = self._selected_index()
-        if index is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             return
-        removed = self.entries.pop(index)
+        removed_names = [self.entries[index].entry_name for index in selected_indices]
+        next_index = selected_indices[0]
+        for index in reversed(selected_indices):
+            self.entries.pop(index)
         self.preview_player.stop()
         self._reset_preview_progress()
         self._refresh_tree()
         if self.entries:
-            self._select_entry(min(index, len(self.entries) - 1))
+            self._select_entry(min(next_index, len(self.entries) - 1))
         else:
             self._update_preview_info()
-        self.status_var.set(f"Removed entry '{removed.entry_name}'.")
+        if len(removed_names) == 1:
+            self.status_var.set(f"Removed entry '{removed_names[0]}'.")
+        else:
+            self.status_var.set(f"Removed {len(removed_names)} entries.")
 
     def _move_selected(self, delta: int) -> None:
         if not self._apply_selected_entry():
@@ -2885,18 +3142,26 @@ class DyingAudioApp(tk.Tk):
         if self.sort_field_var.get().strip() != "Original Order":
             self._show_info_window("Reorder entries", "Switch sorting back to Original Order before moving entries manually.")
             return
-        index = self._selected_index()
-        if index is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
+            return
+        if delta not in (-1, 1):
+            return
+        if delta < 0 and selected_indices[0] == 0:
+            return
+        if delta > 0 and selected_indices[-1] == len(self.entries) - 1:
             return
 
-        target = index + delta
-        if target < 0 or target >= len(self.entries):
-            return
-
-        self.entries[index], self.entries[target] = self.entries[target], self.entries[index]
+        if delta < 0:
+            for index in selected_indices:
+                self.entries[index - 1], self.entries[index] = self.entries[index], self.entries[index - 1]
+            moved_indices = [index - 1 for index in selected_indices]
+        else:
+            for index in reversed(selected_indices):
+                self.entries[index + 1], self.entries[index] = self.entries[index], self.entries[index + 1]
+            moved_indices = [index + 1 for index in selected_indices]
         self._refresh_tree()
-        self.tree.selection_set(str(target))
-        self.tree.focus(str(target))
+        self._select_entries(moved_indices)
         self.status_var.set("Reordered entries.")
 
     def _clear_entries(self) -> None:
@@ -3146,12 +3411,12 @@ class DyingAudioApp(tk.Tk):
         if not self._apply_selected_entry():
             return
 
-        index = self._selected_index()
-        if index is None:
+        selected_indices = tuple(self._selected_indices())
+        if not selected_indices:
             self._show_info_window("Preview audio", "Select an entry to preview first.")
             return
 
-        entry = self.entries[index]
+        entry = self.entries[selected_indices[0]]
         try:
             preview_path = self.preview_player.play_entry(entry, self._append_log)
         except Exception as exc:
@@ -3161,7 +3426,10 @@ class DyingAudioApp(tk.Tk):
             return
 
         self._begin_preview_progress(entry)
-        self.status_var.set(f"Previewing '{entry.entry_name}'.")
+        if len(selected_indices) == 1:
+            self.status_var.set(f"Previewing '{entry.entry_name}'.")
+        else:
+            self.status_var.set(f"Previewing '{entry.entry_name}' from the current multi-selection.")
         self._append_log(f"Previewing {entry.entry_name} from {preview_path}")
 
     def _stop_preview(self) -> None:
