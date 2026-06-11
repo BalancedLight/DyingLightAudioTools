@@ -89,6 +89,10 @@ def _is_fsb_source(path: str | Path) -> bool:
     return Path(path).suffix.lower() == ".fsb"
 
 
+def _normalize_dl1_entry_name(name: str) -> str:
+    return name.lower()
+
+
 def _clamp_speech_intensity(value: float) -> float:
     return max(SPEECH_INTENSITY_MIN, min(SPEECH_INTENSITY_MAX, float(value)))
 
@@ -2556,9 +2560,10 @@ class DyingAudioApp(tk.Tk):
 
     def _apply_bulk_entry_name(self, indices: tuple[int, ...], base_name: str) -> list[str]:
         width = max(2, len(str(max(0, len(indices) - 1))))
+        normalized_base_name = _normalize_dl1_entry_name(base_name)
         renamed: list[str] = []
         for offset, index in enumerate(indices):
-            name = base_name if len(indices) == 1 else f"{base_name}_{offset:0{width}d}"
+            name = normalized_base_name if len(indices) == 1 else f"{normalized_base_name}_{offset:0{width}d}"
             self.entries[index].entry_name = name
             renamed.append(name)
         return renamed

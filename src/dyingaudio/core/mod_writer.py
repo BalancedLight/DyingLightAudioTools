@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -43,6 +43,17 @@ def _safe_temp_name(entry: AudioEntry, source_path: Path) -> str:
     safe_stem = safe_stem.strip("._") or source_path.stem or "audio"
     unique_suffix = hashlib.sha1(str(source_path.resolve()).encode("utf-8")).hexdigest()[:10]
     return f"{safe_stem}_{unique_suffix}"
+
+
+def _normalize_entry_name(entry_name: str) -> str:
+    return entry_name.lower()
+
+
+def _normalize_entry_names(entries: list[AudioEntry]) -> list[AudioEntry]:
+    return [
+        entry if entry.entry_name == _normalize_entry_name(entry.entry_name) else replace(entry, entry_name=_normalize_entry_name(entry.entry_name))
+        for entry in entries
+    ]
 
 
 def _compile_entries(
@@ -270,11 +281,12 @@ def build_csb_file(
     destination = Path(output_path).expanduser().resolve()
     if destination.suffix.lower() != ".csb":
         destination = destination.with_suffix(".csb")
+    normalized_entries = _normalize_entry_names(entries)
 
     with tempfile.TemporaryDirectory(prefix="dyingaudio_build_") as temp_dir:
         temp_root = Path(temp_dir)
         prepared_entries = _prepare_entries(
-            entries,
+            normalized_entries,
             builder_mode,
             toolchain,
             temp_root,
