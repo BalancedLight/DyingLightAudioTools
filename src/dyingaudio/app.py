@@ -6,11 +6,12 @@ import subprocess
 import tempfile
 import traceback
 import time
+import sys
 import tkinter as tk
 import webbrowser
 from dataclasses import replace
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, font as tkfont, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
@@ -18,6 +19,7 @@ from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.background import BackgroundTaskRunner, TaskCancelled, TaskProgress
 from dyingaudio.core.csb import WORKSHOP_MAGIC, extract_csb, parse_csb
 from dyingaudio.core.dldt import DldtToolchain, compile_audio_to_fsb, discover_toolchain
+from dyingaudio.core.localized_text import load_text_catalog, upsert_scr_text
 from dyingaudio.core.manifest import load_manifest, write_manifest
 from dyingaudio.core.media_tools import (
     AUDIO_EXPORT_FILETYPES,
@@ -30,6 +32,7 @@ from dyingaudio.core.media_tools import (
     run_hidden,
 )
 from dyingaudio.core.mod_writer import build_csb_file, build_mod
+from dyingaudio.core.windows_shell import register_csb_open_with, unregister_csb_open_with
 from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.core.spb import SpeechBuildOptions
@@ -82,6 +85,9 @@ SPEECH_INTENSITY_MIN = 0.0
 SPEECH_INTENSITY_MAX = 2.0
 DEFAULT_SPEECH_INTENSITY = 1.0
 MIXED_DETAIL_VALUE = "[mixed]"
+DEFAULT_LOCALIZED_TEXT_MESSAGE = (
+    "No text entry found. Browse for your text source or add a valid string entry to your text source!"
+)
 GITHUB_REPOSITORY_URL = "https://github.com/BalancedLight/DyingLightAudioTools/wiki"
 
 
@@ -102,6 +108,18 @@ def _format_speech_intensity(value: float) -> str:
     if clamped.is_integer():
         return str(int(clamped))
     return f"{clamped:.2f}".rstrip("0").rstrip(".")
+
+
+def _collect_startup_csb_paths(argv: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for raw in argv:
+        if raw.startswith("-"):
+            continue
+        candidate = Path(raw).expanduser()
+        if candidate.suffix.lower() != ".csb":
+            continue
+        paths.append(candidate)
+    return paths
 
 
 class DyingAudioApp(tk.Tk):
@@ -190,6 +208,12 @@ class DyingAudioApp(tk.Tk):
         self.selected_source_var = tk.StringVar(value="")
         self.selected_fsb_var = tk.StringVar(value="")
         self.selected_notes_var = tk.StringVar(value="")
+        self._localized_text_catalog: dict[str, str] = {}
+        self._localized_text_catalog_source: str = ""
+        self._localized_text_dirty = False
+        self._localized_text_snapshot = ""
+        self._localized_text_entry_index: int | None = None
+        self._localized_text_placeholder_active = False
         self._detail_form_loading = False
         self._detail_form_dirty = False
         self._detail_entry_index: int | None = None
@@ -210,9 +234,12 @@ class DyingAudioApp(tk.Tk):
         self._console_visible = True
         self._welcome_window: tk.Toplevel | None = None
         self._welcome_configure_after_id: str | None = None
+        self._skip_welcome_wizard = False
         self._menus: list[tk.Menu] = []
         self.file_menu: tk.Menu | None = None
         self._welcome_background_image: tk.PhotoImage | None = None
+        self._localized_text_widget_font: tkfont.Font | None = None
+        self._localized_text_widget_bold_font: tkfont.Font | None = None
 
         self._configure_high_contrast()
         self._build_ui()
@@ -498,6 +525,7 @@ class DyingAudioApp(tk.Tk):
             getattr(self, "proc_text", None),
             getattr(self, "preview_text", None),
             getattr(self, "log_text", None),
+            getattr(self, "localized_text_display", None),
         ):
             if widget is not None:
                 style_scrolled_text(widget, colors)
@@ -597,6 +625,7 @@ class DyingAudioApp(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=False)
         self._menus.append(settings_menu)
         settings_menu.add_command(label="Folders and Tools...", command=self._show_settings_window)
+        settings_menu.add_command(label=".csb/.spb File Types...", command=self._open_csb_file_types_setup)
         settings_menu.add_command(label="Open Welcome Menu", command=lambda: self._show_welcome_wizard(force=True))
         settings_menu.add_checkbutton(
             label="Show Welcome On Startup",
@@ -853,7 +882,7 @@ class DyingAudioApp(tk.Tk):
         self.sort_combo = ttk.Combobox(
             filter_bar,
             textvariable=self.sort_field_var,
-            values=("Original Order", "Name", "Mode", "Source", "Type", "Duration", "Samples"),
+            values=("Original Order", "Name", "Mode", "Type", "Duration", "Samples"),
             state="readonly",
             width=18,
         )
@@ -863,7 +892,7 @@ class DyingAudioApp(tk.Tk):
         ttk.Button(filter_bar, text="Clear Search", command=self._clear_search).grid(row=0, column=5, sticky="ew", padx=(0, 8))
         ttk.Label(filter_bar, textvariable=self.entry_count_var).grid(row=0, column=6, sticky="e")
 
-        columns = ("name", "mode", "source", "type", "duration", "samples")
+        columns = ("name", "mode", "type", "duration", "samples")
         self.tree = ttk.Treeview(entries_frame, columns=columns, show="headings", height=14, selectmode="extended")
         self.tree.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
@@ -873,7 +902,6 @@ class DyingAudioApp(tk.Tk):
         headings = {
             "name": ("Entry Name", 220),
             "mode": ("Mode", 110),
-            "source": ("Source", 420),
             "type": ("Type", 120),
             "duration": ("Duration (ms)", 110),
             "samples": ("Samples @ 48k", 120),
@@ -888,6 +916,7 @@ class DyingAudioApp(tk.Tk):
 
         self.entry_context_menu = tk.Menu(self, tearoff=False)
         self.entry_context_menu.add_command(label="Replace Audio / FSB...", command=self._replace_selected_with_source)
+        self.entry_context_menu.add_command(label="Open Source", command=self._open_selected_source)
         self.entry_context_menu.add_separator()
         self.entry_context_menu.add_command(label="Export Audio...", command=self._export_selected_audio)
         self.entry_context_menu.add_command(label="Export FSB...", command=self._export_selected_fsb)
@@ -921,8 +950,20 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(detail_frame, text="Duration (ms)").grid(row=4, column=0, sticky="w", padx=6, pady=6)
         self.selected_duration_entry = ttk.Entry(detail_frame, textvariable=self.selected_duration_var)
         self.selected_duration_entry.grid(row=4, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(detail_frame, text="Source").grid(row=5, column=0, sticky="nw", padx=6, pady=6)
-        ttk.Label(detail_frame, textvariable=self.selected_source_var, wraplength=420).grid(row=5, column=1, sticky="w", padx=6, pady=6)
+        self.localized_text_frame = ttk.LabelFrame(detail_frame, text="Localized Text")
+        self.localized_text_frame.columnconfigure(0, weight=1)
+        self.localized_text_display = ScrolledText(self.localized_text_frame, height=6, wrap="word", state="disabled")
+        self.localized_text_display.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.localized_text_display.configure(cursor="arrow")
+        self.localized_text_display.bind("<<Modified>>", self._on_localized_text_modified)
+        self.localized_text_display.bind("<FocusIn>", self._on_localized_text_focus_in)
+        self._localized_text_widget_font = tkfont.Font(font=self.localized_text_display.cget("font"))
+        self._localized_text_widget_bold_font = self._localized_text_widget_font.copy()
+        self._localized_text_widget_bold_font.configure(weight="bold")
+        self.localized_text_display.tag_configure("normal", font=self._localized_text_widget_font)
+        self.localized_text_display.tag_configure("bold", font=self._localized_text_widget_bold_font)
+        self.localized_text_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
+        self.localized_text_frame.grid_remove()
         ttk.Label(detail_frame, text="FSB").grid(row=6, column=0, sticky="nw", padx=6, pady=6)
         ttk.Label(detail_frame, textvariable=self.selected_fsb_var, wraplength=420).grid(row=6, column=1, sticky="w", padx=6, pady=6)
         ttk.Label(detail_frame, text="Notes").grid(row=7, column=0, sticky="nw", padx=6, pady=6)
@@ -1049,6 +1090,8 @@ class DyingAudioApp(tk.Tk):
         self._update_speech_intensity_controls()
         self._update_toolchain_status()
         self._update_speech_summary()
+        self._refresh_localized_text_catalog()
+        self._update_localized_text_display()
         self._update_script_preview()
 
     def _on_welcome_toggle_changed(self, *_args: object) -> None:
@@ -1070,7 +1113,7 @@ class DyingAudioApp(tk.Tk):
         if self._detail_form_loading or self._detail_entry_index is None:
             return
         self._detail_form_dirty = True
-        self._update_selected_entry_controls()
+        self._update_apply_entry_button_state()
 
     def _populate_selected_entry_details(self, indices: int | list[int] | tuple[int, ...] | None) -> None:
         normalized = self._normalize_selection_indices(indices)
@@ -1085,7 +1128,6 @@ class DyingAudioApp(tk.Tk):
                 self.selected_duration_var.set("0")
                 self.selected_speech_intensity_var.set(_format_speech_intensity(DEFAULT_SPEECH_INTENSITY))
                 self.selected_speech_intensity_scale_var.set(DEFAULT_SPEECH_INTENSITY)
-                self.selected_source_var.set("")
                 self.selected_fsb_var.set("")
                 self.selected_notes_var.set("")
             elif len(normalized) == 1:
@@ -1096,7 +1138,6 @@ class DyingAudioApp(tk.Tk):
                 self.selected_duration_var.set(str(entry.duration_ms))
                 self.selected_speech_intensity_var.set(_format_speech_intensity(entry.speech_intensity))
                 self.selected_speech_intensity_scale_var.set(_clamp_speech_intensity(entry.speech_intensity))
-                self.selected_source_var.set(entry.source_path)
                 self.selected_fsb_var.set(entry.fsb_path)
                 self.selected_notes_var.set(entry.notes)
             else:
@@ -1112,7 +1153,6 @@ class DyingAudioApp(tk.Tk):
                     )
                 )
                 self.selected_speech_intensity_scale_var.set(_clamp_speech_intensity(entries[0].speech_intensity))
-                self.selected_source_var.set(self._detail_display_value([entry.source_path for entry in entries]))
                 self.selected_fsb_var.set(self._detail_display_value([entry.fsb_path for entry in entries]))
                 self.selected_notes_var.set(self._detail_display_value([entry.notes for entry in entries]))
         finally:
@@ -1137,10 +1177,187 @@ class DyingAudioApp(tk.Tk):
             self.selected_speech_intensity_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
         else:
             self.selected_speech_intensity_frame.grid_remove()
-        self.apply_entry_button.configure(state="normal" if has_selection and self._detail_form_dirty else "disabled")
+        if has_selection and self.localized_bank_var.get():
+            self.localized_text_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
+        else:
+            self.localized_text_frame.grid_remove()
+        self._update_localized_text_display()
+        self._update_apply_entry_button_state()
+
+    def _update_apply_entry_button_state(self) -> None:
+        has_selection = bool(self._detail_entry_indices)
+        has_changes = self._detail_form_dirty or self._localized_text_dirty
+        self.apply_entry_button.configure(state="normal" if has_selection and has_changes else "disabled")
 
     def _speech_controls_enabled(self) -> bool:
         return self.localized_bank_var.get() or self.generate_spb_var.get()
+
+    def _current_loaded_csb_key(self) -> str | None:
+        if self.loaded_csb_path is None:
+            return None
+        return str(self.loaded_csb_path.resolve()).casefold()
+
+    def _refresh_localized_text_catalog(self) -> None:
+        source = self.speech_text_source_var.get().strip()
+        if source == self._localized_text_catalog_source:
+            return
+        self._localized_text_catalog_source = source
+        if not source:
+            self._localized_text_catalog = {}
+            return
+        try:
+            self._localized_text_catalog = load_text_catalog(source)
+        except OSError:
+            self._localized_text_catalog = {}
+
+    def _localized_text_for_selected_entry(self) -> str | None:
+        if not self.localized_bank_var.get():
+            return None
+        indices = self._normalize_selection_indices(self._detail_entry_indices)
+        if len(indices) != 1:
+            return None
+        if not indices[0] < len(self.entries):
+            return None
+        self._refresh_localized_text_catalog()
+        entry = self.entries[indices[0]]
+        value = self._localized_text_catalog.get(entry.entry_name.casefold())
+        return value if value and value.strip() else None
+
+    def _localized_text_is_editable(self) -> bool:
+        indices = self._normalize_selection_indices(self._detail_entry_indices)
+        return self.localized_bank_var.get() and len(indices) == 1 and indices[0] < len(self.entries)
+
+    def _localized_text_editor_value(self) -> str:
+        if not hasattr(self, "localized_text_display") or self.localized_text_display is None:
+            return ""
+        text = self.localized_text_display.get("1.0", "end-1c")
+        if getattr(self, "_localized_text_placeholder_active", False) and text == DEFAULT_LOCALIZED_TEXT_MESSAGE:
+            return ""
+        return text
+
+    def _set_localized_text_snapshot(self, text: str) -> None:
+        indices = self._normalize_selection_indices(self._detail_entry_indices)
+        self._localized_text_snapshot = text
+        self._localized_text_entry_index = indices[0] if len(indices) == 1 else None
+        self._localized_text_dirty = False
+
+    def _on_localized_text_modified(self, _event: object) -> None:
+        if not hasattr(self, "localized_text_display") or self.localized_text_display is None:
+            return
+        if not self.localized_text_display.edit_modified():
+            return
+        self.localized_text_display.edit_modified(False)
+        if self._detail_form_loading:
+            return
+        if not DyingAudioApp._localized_text_is_editable(self):
+            return
+        text = DyingAudioApp._localized_text_editor_value(self)
+        current_index = self._detail_entry_indices[0] if len(self._detail_entry_indices) == 1 else None
+        self._localized_text_dirty = current_index == self._localized_text_entry_index and text != self._localized_text_snapshot
+        self._update_apply_entry_button_state()
+
+    def _on_localized_text_focus_in(self, _event: object) -> None:
+        if not getattr(self, "_localized_text_placeholder_active", False):
+            return
+        if not DyingAudioApp._localized_text_is_editable(self):
+            return
+        self.localized_text_display.delete("1.0", tk.END)
+        self.localized_text_display.edit_modified(False)
+        self._localized_text_placeholder_active = False
+
+    def _set_localized_text_display(self, text: str, *, bold: bool, editable: bool) -> None:
+        if not hasattr(self, "localized_text_display") or self.localized_text_display is None:
+            return
+        widget = self.localized_text_display
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        if text:
+            widget.insert("1.0", text, ("bold" if bold else "normal",))
+        if hasattr(widget, "edit_modified"):
+            widget.edit_modified(False)
+        widget.configure(state="normal" if editable else "disabled", cursor="xterm" if editable else "arrow")
+        self._localized_text_placeholder_active = bold and editable and text == DEFAULT_LOCALIZED_TEXT_MESSAGE
+
+    def _update_localized_text_display(self) -> None:
+        if not hasattr(self, "localized_text_display") or self.localized_text_display is None:
+            return
+        show_panel = bool(self._detail_entry_indices) and self.localized_bank_var.get()
+        if not show_panel:
+            self._set_localized_text_display("", bold=False, editable=False)
+            DyingAudioApp._set_localized_text_snapshot(self, "")
+            return
+        if not DyingAudioApp._localized_text_is_editable(self):
+            self._set_localized_text_display(DEFAULT_LOCALIZED_TEXT_MESSAGE, bold=True, editable=False)
+            DyingAudioApp._set_localized_text_snapshot(self, "")
+            return
+        text = self._localized_text_for_selected_entry()
+        if text is None:
+            self._set_localized_text_display(DEFAULT_LOCALIZED_TEXT_MESSAGE, bold=True, editable=True)
+            DyingAudioApp._set_localized_text_snapshot(self, "")
+            return
+        self._set_localized_text_display(text, bold=False, editable=True)
+        DyingAudioApp._set_localized_text_snapshot(self, text)
+
+    def _save_selected_localized_text(self) -> bool:
+        if not self._localized_text_dirty:
+            return True
+        if not DyingAudioApp._localized_text_is_editable(self) or self._localized_text_entry_index is None:
+            self._localized_text_dirty = False
+            self._update_apply_entry_button_state()
+            return True
+        source = self.speech_text_source_var.get().strip()
+        if not source:
+            self._show_error_window(
+                "Save localized text failed",
+                "Set a text source .scr file first in Project > Text Source before saving localized text edits.",
+            )
+            self.status_var.set("Localized text update failed.")
+            return False
+        source_path = Path(source).expanduser().resolve()
+        if source_path.suffix.lower() != ".scr":
+            self._show_error_window(
+                "Save localized text failed",
+                "Localized text editing currently supports .scr files only. Choose a .scr text source.",
+            )
+            self.status_var.set("Localized text update failed.")
+            return False
+
+        entry = self.entries[self._localized_text_entry_index]
+        text = DyingAudioApp._localized_text_editor_value(self)
+        try:
+            upsert_scr_text(source_path, entry.entry_name, text)
+        except OSError as exc:
+            self._show_error_window("Save localized text failed", str(exc))
+            self.status_var.set("Localized text update failed.")
+            return False
+
+        self._localized_text_catalog_source = str(source_path)
+        self._localized_text_catalog[entry.entry_name.casefold()] = text
+        DyingAudioApp._set_localized_text_snapshot(self, text)
+        self._append_log(f"Updated localized text in {source_path.name}: {entry.entry_name}")
+        return True
+
+    def _remember_current_bank_text_source(self) -> None:
+        bank_key = self._current_loaded_csb_key()
+        if bank_key is None:
+            return
+        text_source = self.speech_text_source_var.get().strip()
+        if text_source:
+            self.settings.dl1.bank_text_sources[bank_key] = text_source
+        else:
+            self.settings.dl1.bank_text_sources.pop(bank_key, None)
+
+    def _apply_loaded_bank_text_source_state(self) -> None:
+        bank_key = self._current_loaded_csb_key()
+        remembered_source = self.settings.dl1.bank_text_sources.get(bank_key, "") if bank_key is not None else ""
+        self.speech_text_source_var.set(remembered_source)
+        has_source = bool(remembered_source)
+        self.localized_bank_var.set(has_source)
+        self.generate_spb_var.set(False)
+        self._refresh_localized_text_catalog()
+        self._update_speech_intensity_controls()
+        self._update_speech_summary()
+        self._update_script_preview()
 
     def _update_speech_intensity_controls(self) -> None:
         show_controls = self._speech_controls_enabled()
@@ -1545,7 +1762,6 @@ class DyingAudioApp(tk.Tk):
         field_map = {
             "Entry Name": "Name",
             "Mode": "Mode",
-            "Source": "Source",
             "Type": "Type",
             "Duration (ms)": "Duration",
             "Samples @ 48k": "Samples",
@@ -1904,6 +2120,7 @@ class DyingAudioApp(tk.Tk):
         )
         if selection:
             self.speech_text_source_var.set(str(Path(selection).resolve()))
+            self._remember_current_bank_text_source()
             self._save_settings()
 
     def _tool_settings_snapshot(self) -> ToolSettings:
@@ -2026,6 +2243,96 @@ class DyingAudioApp(tk.Tk):
         self._center_child_window(window, 920, 560)
         window.lift()
 
+    def _current_packaged_exe_path(self) -> Path:
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("CSB association registration is only available in the compiled DyingAudio executable.")
+        return Path(sys.executable).resolve()
+
+    def _show_csb_association_window(self) -> None:
+        window = tk.Toplevel(self)
+        window.title(".csb / .spb File Types")
+        window.transient(self)
+        window.geometry("680x300")
+        window.minsize(560, 240)
+        if is_windows_dark_mode():
+            window.configure(bg="#1e1e1e")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(window, padding=16)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            container,
+            text="Register DyingAudio file types so Windows shows .csb as Compiled Sound Bank and .spb as Speech Pattern Bank.",
+            wraplength=620,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            container,
+            text="This only updates your current Windows user. .csb keeps the DyingAudio Open with entry, and .spb gets a friendly type name without a direct opener.",
+            wraplength=620,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        exe_text = str(Path(sys.executable).resolve()) if getattr(sys, "frozen", False) else "Available in the compiled DyingAudio executable only."
+        ttk.Label(container, text=f"Current executable: {exe_text}", wraplength=620).grid(row=2, column=0, sticky="w", pady=(12, 0))
+
+        button_row = ttk.Frame(container)
+        button_row.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=1)
+
+        can_register = getattr(sys, "frozen", False)
+        ttk.Button(
+            button_row,
+            text="Register File Types",
+            command=self._register_csb_association,
+            state="normal" if can_register else "disabled",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text="Remove File Types",
+            command=self._remove_csb_association,
+            state="normal" if can_register else "disabled",
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        ttk.Button(container, text="Close", command=window.destroy).grid(row=4, column=0, sticky="e", pady=(20, 0))
+        self._center_child_window(window, 680, 300)
+        window.lift()
+
+    def _open_csb_file_types_setup(self) -> None:
+        self._show_csb_association_window()
+
+    def _register_csb_association(self) -> None:
+        try:
+            exe_path = self._current_packaged_exe_path()
+            register_csb_open_with(exe_path)
+        except Exception as exc:
+            self._show_error_window(".csb / .spb File Types", str(exc))
+            return
+
+        self._show_info_window(
+            ".csb / .spb File Types",
+            "DyingAudio file types have been registered for this Windows user.\n\n"
+            ".csb is labeled as Compiled Sound Bank and remains available in Explorer's Open with menu.\n"
+            ".spb is labeled as Speech Pattern Bank without a direct open command.\n\n"
+            f"Registered executable:\n{exe_path}",
+        )
+
+    def _remove_csb_association(self) -> None:
+        try:
+            exe_path = self._current_packaged_exe_path()
+            unregister_csb_open_with()
+        except Exception as exc:
+            self._show_error_window(".csb / .spb File Types", str(exc))
+            return
+
+        self._show_info_window(
+            ".csb / .spb File Types",
+            "DyingAudio's .csb and .spb file-type registrations have been removed from this Windows user.\n\n"
+            f"Last registered executable:\n{exe_path}",
+        )
+
     def _tool_status_rows(self) -> list[tuple[str, bool, str, tk.StringVar | None]]:
         self._refresh_tool_discovery()
         self._update_toolchain_status()
@@ -2091,7 +2398,7 @@ class DyingAudioApp(tk.Tk):
         window.lift()
 
     def _maybe_show_welcome_wizard(self) -> None:
-        if not self.show_welcome_on_startup_var.get():
+        if self._skip_welcome_wizard or not self.show_welcome_on_startup_var.get():
             return
         self._show_welcome_wizard(force=False)
 
@@ -2346,6 +2653,35 @@ class DyingAudioApp(tk.Tk):
                     if label in editing_names and label != "Wwise 2023.1.13.8732":
                         row = add_status_row(row, label, installed, detail, variable)
 
+                tk.Label(
+                    panel,
+                    text="Optional first-time setup:",
+                    fg="#ffffff",
+                    bg="#000000",
+                    font=("TkDefaultFont", 11, "bold"),
+                    anchor="w",
+                    justify="left",
+                ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 4))
+                row += 1
+                tk.Label(
+                    panel,
+                    text="Register .csb and .spb file types so they open with DyingAudio from Windows Explorer.",
+                    fg="#ffffff",
+                    bg="#000000",
+                    wraplength=360,
+                    justify="left",
+                    anchor="w",
+                ).grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+                row += 1
+                overlay_button(panel, "Register File Types", self._open_csb_file_types_setup).grid(
+                    row=row,
+                    column=0,
+                    columnspan=3,
+                    sticky="ew",
+                    pady=(0, 4),
+                )
+                row += 1
+
                 overlay_button(panel, "Continue", lambda: (screen_var.set(2), redraw())).grid(
                     row=99,
                     column=0,
@@ -2431,7 +2767,6 @@ class DyingAudioApp(tk.Tk):
                 values=(
                     entry.entry_name,
                     entry.source_mode,
-                    entry.display_source(),
                     format_entry_type(entry.entry_type),
                     entry.duration_ms,
                     entry.sample_count,
@@ -2453,7 +2788,6 @@ class DyingAudioApp(tk.Tk):
                 (index, entry)
                 for index, entry in indexed_entries
                 if search_text in entry.entry_name.lower()
-                or search_text in entry.display_source().lower()
                 or search_text in entry.notes.lower()
                 or search_text in format_entry_type(entry.entry_type).lower()
             ]
@@ -2463,7 +2797,6 @@ class DyingAudioApp(tk.Tk):
             key_map = {
                 "Name": lambda pair: pair[1].entry_name.lower(),
                 "Mode": lambda pair: pair[1].source_mode.lower(),
-                "Source": lambda pair: pair[1].display_source().lower(),
                 "Type": lambda pair: pair[1].entry_type,
                 "Duration": lambda pair: pair[1].duration_ms,
                 "Samples": lambda pair: pair[1].sample_count,
@@ -2495,14 +2828,14 @@ class DyingAudioApp(tk.Tk):
         selected_indices = tuple(self._selected_indices())
         current_indices = self._detail_entry_indices
         current_index = self._detail_entry_index
-        if self._detail_form_dirty and current_indices != selected_indices:
+        if (self._detail_form_dirty or self._localized_text_dirty) and current_indices != selected_indices:
             current_name = "the current selection"
             if len(current_indices) == 1 and current_index is not None and 0 <= current_index < len(self.entries):
                 current_name = f"'{self.entries[current_index].entry_name}'"
             elif current_indices:
                 current_name = f"the {len(current_indices)} selected entries"
             choice = self._ask_yes_no_cancel_window(
-                "Unsaved entry changes",
+                "Unsaved changes",
                 (
                     f"Apply changes to {current_name} before switching selection?\n\n"
                     "Yes = apply changes\n"
@@ -2519,9 +2852,12 @@ class DyingAudioApp(tk.Tk):
                     self._restore_tree_selection(current_indices)
                 return
             self._detail_form_dirty = False
+            self._localized_text_dirty = False
+            self._update_localized_text_display()
+            self._update_apply_entry_button_state()
 
-        if selected_indices == current_indices and self._detail_form_dirty:
-            self._update_selected_entry_controls()
+        if selected_indices == current_indices and (self._detail_form_dirty or self._localized_text_dirty):
+            self._update_apply_entry_button_state()
             self._update_preview_info()
             return
 
@@ -2541,12 +2877,18 @@ class DyingAudioApp(tk.Tk):
 
         selected_entries = self._selected_entries()
         has_selection = bool(selected_entries)
+        can_open_source = False
+        if len(selected_entries) == 1:
+            entry = selected_entries[0]
+            source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
+            can_open_source = source is not None and source.exists()
         can_export_audio = has_selection
         can_export_fsb = has_selection and (
             self.current_toolchain is not None or all(entry.source_mode == "fsb" for entry in selected_entries)
         )
 
         self.entry_context_menu.entryconfigure("Replace Audio / FSB...", state="normal" if has_selection else "disabled")
+        self.entry_context_menu.entryconfigure("Open Source", state="normal" if can_open_source else "disabled")
         self.entry_context_menu.entryconfigure("Export Audio...", state="normal" if can_export_audio else "disabled")
         self.entry_context_menu.entryconfigure("Export FSB...", state="normal" if can_export_fsb else "disabled")
         self.entry_context_menu.entryconfigure("Duplicate Entry", state="normal" if has_selection else "disabled")
@@ -2572,11 +2914,14 @@ class DyingAudioApp(tk.Tk):
         indices = self._normalize_selection_indices(self._detail_entry_indices if target_indices is None else target_indices)
         if not indices:
             return True
+        localized_dirty = bool(getattr(self, "_localized_text_dirty", False))
+        if localized_dirty and len(indices) != 1:
+            localized_dirty = False
         displayed_values = self._detail_values()
         changed_fields = {
             key: displayed_values[key] != self._detail_snapshot.get(key, displayed_values[key]) for key in displayed_values
         }
-        if not any(changed_fields.values()):
+        if not any(changed_fields.values()) and not localized_dirty:
             self._detail_form_dirty = False
             self._update_selected_entry_controls()
             return True
@@ -2631,13 +2976,18 @@ class DyingAudioApp(tk.Tk):
             if speech_intensity is not None:
                 entry.speech_intensity = speech_intensity
 
+        if localized_dirty:
+            self._localized_text_entry_index = indices[0]
+            if not self._save_selected_localized_text():
+                return False
+
         self._detail_form_dirty = False
         self._refresh_tree()
-        if len(indices) == 1:
+        if len(indices) == 1 and (any(changed_fields.values()) or localized_dirty):
             self.status_var.set(f"Updated entry '{self.entries[indices[0]].entry_name}'.")
         elif renamed_entries:
             self.status_var.set(f"Updated {len(indices)} entries with base name '{self.selected_name_var.get().strip()}'.")
-        else:
+        elif any(changed_fields.values()) or localized_dirty:
             self.status_var.set(f"Updated {len(indices)} entries.")
         return True
 
@@ -2757,6 +3107,7 @@ class DyingAudioApp(tk.Tk):
             return
         if self.entries and not self._ask_yes_no_window("New empty CSB", "Start a new empty CSB and clear the current entries?"):
             return
+        self._save_settings()
         self.preview_player.stop()
         self._reset_preview_progress()
         self.preview_player.clear_cache()
@@ -2766,22 +3117,32 @@ class DyingAudioApp(tk.Tk):
         self._set_loaded_csb_magic(None)
         self._set_loaded_csb_layout(None)
         self._refresh_tree()
+        self._apply_loaded_bank_text_source_state()
         self._update_preview_info()
         self.status_var.set("Started a new empty CSB.")
 
-    def _open_csb_for_editing(self) -> None:
-        selection = filedialog.askopenfilename(
-            title="Open CSB",
-            filetypes=[("CSB files", "*.csb"), ("All files", "*.*")],
-        )
+    def _open_csb_for_editing(self, selection: str | Path | None = None) -> None:
+        if selection is None:
+            selection = filedialog.askopenfilename(
+                title="Open CSB",
+                filetypes=[("CSB files", "*.csb"), ("All files", "*.*")],
+            )
         if not selection:
             return
 
+        selection_path = Path(selection).expanduser().resolve()
+        if not selection_path.exists():
+            self._show_error_window("Open CSB failed", f"The selected file does not exist:\n{selection_path}")
+            return
+
+        self._save_settings()
+        self._select_main_tab(self.dl1_tab)
+
         def worker(progress, _log):
             progress("Parsing CSB header...", None, None)
-            parsed = parse_csb(selection)
+            parsed = parse_csb(selection_path)
             session_dir = tempfile.TemporaryDirectory(prefix="dyingaudio_edit_")
-            extracted = extract_csb(selection, session_dir.name, progress=progress)
+            extracted = extract_csb(selection_path, session_dir.name, progress=progress)
             return parsed, session_dir, extracted
 
         def on_success(result: object) -> None:
@@ -2792,9 +3153,9 @@ class DyingAudioApp(tk.Tk):
             self._cleanup_edit_session()
             self.edit_session_dir = session_dir
             self.entries = extracted
-            self.bundle_name_var.set(Path(selection).stem)
+            self.bundle_name_var.set(selection_path.stem)
             self.builder_mode_var.set("Existing FSB Files")
-            self._set_loaded_csb(selection)
+            self._set_loaded_csb(selection_path)
             self._set_loaded_csb_magic(parsed.magic)
             self._set_loaded_csb_layout(parsed.layout)
             self._refresh_tree()
@@ -2802,14 +3163,15 @@ class DyingAudioApp(tk.Tk):
                 self._select_entry(0)
             else:
                 self._update_preview_info()
+            self._apply_loaded_bank_text_source_state()
             self.task_status_var.set("Open complete.")
             self._append_log(
-                f"Loaded {Path(selection).name} for editing with {self._format_csb_variant(parsed.magic, parsed.layout)}."
+                f"Loaded {selection_path.name} for editing with {self._format_csb_variant(parsed.magic, parsed.layout)}."
             )
-            self.status_var.set(f"Opened {Path(selection).name} for editing.")
+            self.status_var.set(f"Opened {selection_path.name} for editing.")
 
         self._run_dl1_task(
-            start_message=f"Opening {Path(selection).name}...",
+            start_message=f"Opening {selection_path.name}...",
             error_title="Open CSB failed",
             worker=worker,
             on_success=on_success,
@@ -2869,6 +3231,32 @@ class DyingAudioApp(tk.Tk):
             self.status_var.set(f"Replaced '{entry.entry_name}' with new {replacement_label}.")
         else:
             self.status_var.set(f"Replaced {len(indices)} entries with {self._format_source_summary(raw_count, fsb_count)}.")
+
+    def _open_selected_source(self) -> None:
+        if not self._apply_selected_entry():
+            return
+
+        selected_entries = self._selected_entries()
+        if len(selected_entries) != 1:
+            self._show_info_window("Open source", "Select a single entry first.")
+            return
+
+        entry = selected_entries[0]
+        source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
+        if source is None:
+            self._show_error_window("Open source failed", f"No source path is available for '{entry.entry_name}'.")
+            return
+        if not source.exists():
+            self._show_error_window("Open source failed", f"The source file does not exist:\n{source}")
+            return
+
+        try:
+            os.startfile(str(source))
+        except OSError as exc:
+            self._show_error_window("Open source failed", str(exc))
+            return
+
+        self.status_var.set(f"Opened source for '{entry.entry_name}'.")
 
     def _suggest_export_audio_name(self, entry: AudioEntry) -> str:
         return f"{entry.entry_name}{audio_quality_output_suffix(self.audio_quality_var.get())}"
@@ -3443,6 +3831,7 @@ class DyingAudioApp(tk.Tk):
         self.status_var.set("Preview stopped.")
 
     def _save_settings(self) -> None:
+        self._remember_current_bank_text_source()
         settings = AppSettings()
         settings.dl1.mods_root = self.mods_root_var.get().strip()
         settings.dl1.dldt_root = self.dldt_root_var.get().strip()
@@ -3455,6 +3844,7 @@ class DyingAudioApp(tk.Tk):
         settings.dl1.localized_bank = self.localized_bank_var.get() or self.generate_spb_var.get()
         settings.dl1.generate_spb = self.generate_spb_var.get()
         settings.dl1.speech_text_source = self.speech_text_source_var.get().strip()
+        settings.dl1.bank_text_sources = dict(self.settings.dl1.bank_text_sources)
         settings.dl1.speech_intensity = self._try_parse_speech_intensity(
             self.global_speech_intensity_var.get(),
             default=getattr(settings.dl1, "speech_intensity", DEFAULT_SPEECH_INTENSITY),
@@ -3572,6 +3962,28 @@ class DyingAudioApp(tk.Tk):
         os.startfile(str(target))
 
     def _on_close(self) -> None:
+        if self._detail_form_dirty or self._localized_text_dirty:
+            current_indices = self._detail_entry_indices
+            current_index = self._detail_entry_index
+            current_name = "the current selection"
+            if len(current_indices) == 1 and current_index is not None and 0 <= current_index < len(self.entries):
+                current_name = f"'{self.entries[current_index].entry_name}'"
+            elif current_indices:
+                current_name = f"the {len(current_indices)} selected entries"
+            choice = self._ask_yes_no_cancel_window(
+                "Unsaved changes",
+                (
+                    f"You have unsaved changes for {current_name}.\n\n"
+                    "Yes = apply changes and exit\n"
+                    "No = discard changes and exit\n"
+                    "Cancel = keep editing"
+                ),
+                kind="question",
+            )
+            if choice is None:
+                return
+            if choice and not self._apply_selected_entry(target_indices=current_indices):
+                return
         self._save_settings()
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
@@ -3586,6 +3998,10 @@ class DyingAudioApp(tk.Tk):
         self.destroy()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    startup_paths = _collect_startup_csb_paths(list(sys.argv[1:] if argv is None else argv))
     app = DyingAudioApp()
+    if startup_paths:
+        app._skip_welcome_wizard = True
+        app.after(0, lambda path=startup_paths[0]: app._open_csb_for_editing(path))
     app.mainloop()

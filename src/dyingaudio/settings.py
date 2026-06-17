@@ -72,6 +72,7 @@ class DL1Settings:
     localized_bank: bool = False
     generate_spb: bool = False
     speech_text_source: str = ""
+    bank_text_sources: dict[str, str] = field(default_factory=dict)
     speech_intensity: float = 1.0
     last_output_folder: str = ""
 
@@ -289,11 +290,14 @@ def _migrate_legacy_settings(payload: dict[str, Any]) -> AppSettings:
         "localized_bank": payload.get("localized_bank", settings.dl1.localized_bank),
         "generate_spb": payload.get("generate_spb", settings.dl1.generate_spb),
         "speech_text_source": payload.get("speech_text_source", settings.dl1.speech_text_source),
+        "bank_text_sources": payload.get("bank_text_sources", settings.dl1.bank_text_sources),
         "last_output_folder": payload.get("last_output_folder", settings.dl1.last_output_folder),
     }
     settings.dl1 = _update_dataclass(settings.dl1, legacy_dl1_payload)
     if not settings.dl1.audio_proc_names:
         settings.dl1.audio_proc_names = list(DEFAULT_AUDIO_PROCS)
+    if not isinstance(settings.dl1.bank_text_sources, dict):
+        settings.dl1.bank_text_sources = {}
     return settings
 
 
@@ -324,6 +328,8 @@ def load_settings() -> AppSettings:
         settings.dl1.audio_proc_names = list(DEFAULT_AUDIO_PROCS)
     if not settings.dl1.audio_quality:
         settings.dl1.audio_quality = DEFAULT_DL1_AUDIO_QUALITY
+    if not isinstance(settings.dl1.bank_text_sources, dict):
+        settings.dl1.bank_text_sources = {}
     if not settings.experimental.cache_root:
         settings.experimental.cache_root = DEFAULT_EXPERIMENTAL_CACHE_ROOT
     if not settings.experimental.archive_set:

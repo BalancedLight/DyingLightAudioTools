@@ -9,15 +9,32 @@ from pathlib import Path
 TextCatalog = dict[str, str]
 
 
-def _decode_script_bytes(data: bytes) -> str:
+def _decode_script_bytes_with_encoding(data: bytes) -> tuple[str, str]:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return data.decode("utf-16")
+        return data.decode("utf-16"), "utf-16"
     for encoding in ("utf-8-sig", "cp1250", "latin-1"):
         try:
-            return data.decode(encoding)
+            return data.decode(encoding), encoding
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8", errors="replace"), "utf-8"
+
+
+def _decode_script_bytes(data: bytes) -> str:
+    text, _encoding = _decode_script_bytes_with_encoding(data)
+    return text
+
+
+def _escape_scr_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\0", "\\0")
+    )
+    return escaped
 
 
 def _strip_comments(text: str) -> str:
@@ -151,6 +168,69 @@ def _starts_word(text: str, index: int, word: str) -> bool:
         return False
     end = index + len(word)
     return end >= len(text) or text[end] not in identifier
+
+
+def _find_string_call_span(text: str, key: str) -> tuple[int, int] | None:
+    stripped = _strip_comments(text)
+    index = 0
+    target = key.casefold()
+    while index < len(stripped):
+        if stripped[index] == '"':
+            parsed = _parse_string(stripped, index)
+            if parsed is None:
+                break
+            _, index = parsed
+            continue
+        if not _starts_word(stripped, index, "String"):
+            index += 1
+            continue
+
+        call_start = _skip_ws(stripped, index + len("String"))
+        if call_start >= len(stripped) or stripped[call_start] != "(":
+            index += len("String")
+            continue
+        key_parsed = _parse_string(stripped, call_start + 1)
+        if key_parsed is None:
+            index += len("String")
+            continue
+        parsed_key, after_key = key_parsed
+        if parsed_key.casefold() != target:
+            index = _skip_call_tail(stripped, after_key)
+            continue
+
+        call_end = _skip_call_tail(stripped, after_key)
+        return index, call_end
+    return None
+
+
+def upsert_scr_text(path: str | Path, key: str, value: str) -> None:
+    resolved = Path(path).expanduser().resolve()
+    entry = f'String("{_escape_scr_string(key)}", "{_escape_scr_string(value)}")'
+    if resolved.exists():
+        data = resolved.read_bytes()
+        text, _encoding = _decode_script_bytes_with_encoding(data)
+    else:
+        text = ""
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    span = _find_string_call_span(text, key)
+    if span is None:
+        if text and not text.endswith(("\n", "\r")):
+            text += newline
+        text += entry + newline
+    else:
+        start, end = span
+        line_start = text.rfind("\n", 0, start)
+        line_start = 0 if line_start < 0 else line_start + 1
+        indent_end = line_start
+        while indent_end < start and text[indent_end] in (" ", "\t"):
+            indent_end += 1
+        indent = text[line_start:indent_end]
+        text = text[:start] + indent + entry + text[end:]
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    # Localized text .scr files should save as UTF-8 without a BOM.
+    resolved.write_bytes(text.encode("utf-8"))
 
 
 def _parse_one_string_call(text: str, index: int) -> tuple[str, int] | None:

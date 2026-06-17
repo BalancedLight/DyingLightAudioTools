@@ -13,6 +13,8 @@ Windows-first Python GUI tools for working with Dying Light series audio.
 ### Via Releases
 1. Download the executable
 2. Run it!
+3. If you want Windows to label `.csb` and `.spb` files, open DyingAudio and use `Settings > .csb/.spb File Types...`, then click `Register File Types`
+4. You can also launch the packaged EXE with a `.csb` path on the command line and it will open that bank for editing immediately
 
 If you get an alert from Windows Security or another antimalware executable, ignore it. Antimalware engines do not like packed Python executables!
 If you still feel uncomfortable, you can run via Python below.
@@ -54,11 +56,12 @@ You may also need to install ffmpeg.
 
 ### Edit an existing `.csb`
 
-1. Choose `File > Open CSB For Edit`.
+1. Choose `File > Open CSB`.
 2. Select the entry you want to change.
 3. Click `Replace Audio / FSB`.
 4. Choose a raw audio file such as `.mp3`, `.ogg`, or `.wav`, or pick an `.fsb`.
 5. Preview, adjust entry details if needed, then save or build.
+6. If the compiled app is registered with Explorer, `.csb` files can show DyingAudio in `Open with`, and `.spb` files will show the friendly Speech Pattern Bank type label.
 
 
 ### Selected Entry behavior
