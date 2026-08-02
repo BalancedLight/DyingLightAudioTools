@@ -4,7 +4,7 @@ import hashlib
 import os
 import shutil
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -26,7 +26,7 @@ from dyingaudio.core.media_tools import (
     ensure_portable_tool_layout,
     missing_wem_conversion_requirements,
 )
-from dyingaudio.core.preview import PreviewPlayer
+from dyingaudio.core.preview import PreparedPreview, PreviewPlayer
 from dyingaudio.core.wwise_audio_type import audio_type_label
 from dyingaudio.core.wwise_workspace import (
     BASE_ARCHIVE_SET,
@@ -43,6 +43,9 @@ from dyingaudio.core.wwise_workspace import (
     export_media_files,
     export_workspace_dump,
     game_label,
+    index_named_audio_metadata,
+    materialize_named_audio_link,
+    materialize_named_audio_links,
     media_signature_for_path,
     resolve_archive_bundle,
     workspace_details_text,
@@ -101,9 +104,18 @@ class MediaRenderState:
     final_count_text: str
 
 
+@dataclass(slots=True)
+class BrowserRenderState:
+    rows: list[NamedAudioLink]
+    index: int = 0
+    archive_nodes: dict[str, str] = field(default_factory=dict)
+    bank_nodes: dict[tuple[str, str], str] = field(default_factory=dict)
+    event_nodes: dict[tuple[str, str, str], str] = field(default_factory=dict)
+    first_archive_iid: str | None = None
+
+
 def _media_signature_for_row(row: NamedAudioLink) -> tuple[int, int]:
-    source_path = row.source if row.source.exists() else row.link
-    return media_signature_for_path(str(source_path))
+    return max(row.duration_ms, 0), max(row.sample_count_48k, 0)
 
 
 def _shared_text(values: list[str]) -> str:
@@ -116,6 +128,8 @@ def _shared_text(values: list[str]) -> str:
 
 
 def _media_signature_text(duration_ms: int, sample_count: int) -> str:
+    if duration_ms <= 0 and sample_count <= 0:
+        return "Not indexed"
     return f"{duration_ms} ms / {sample_count} samples"
 
 
@@ -127,6 +141,8 @@ def matching_audio_group_rows(rows: list[NamedAudioLink]) -> list[NamedAudioLink
     if len(rows) < 2:
         return []
     expected_signature = _media_signature_for_row(rows[0])
+    if expected_signature[0] <= 0 and expected_signature[1] <= 0:
+        return []
     if any(_media_signature_for_row(row) != expected_signature for row in rows[1:]):
         return []
     return rows
@@ -140,6 +156,9 @@ def build_media_view_items(rows: list[NamedAudioLink], group_similar: bool) -> l
     group_positions: dict[tuple[int, int], int] = {}
     for row in rows:
         signature = _media_signature_for_row(row)
+        if signature[0] <= 0 and signature[1] <= 0:
+            items.append(row)
+            continue
         position = group_positions.get(signature)
         if position is None:
             group_positions[signature] = len(items)
@@ -237,6 +256,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.task_status_var = tk.StringVar(value="No experimental task running.")
         self.task_progress_var = tk.DoubleVar(value=0.0)
         self.task_runner = BackgroundTaskRunner(self)
+        self.preview_task_runner = BackgroundTaskRunner(self)
+        self._preview_request_id = 0
         self._busy_widgets: list[tk.Widget] = []
         self.loading_window: tk.Toplevel | None = None
         self.loading_status_label: ttk.Label | None = None
@@ -252,6 +273,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.media_group_iids: set[str] = set()
         self._media_render_after_id: str | None = None
         self._media_render_state: MediaRenderState | None = None
+        self._browser_render_after_id: str | None = None
+        self._browser_render_state: BrowserRenderState | None = None
         self.content_paned: ttk.Panedwindow | None = None
         self._pane_layout_initialized = False
         self._pane_layout_after_ids: list[str] = []
@@ -285,8 +308,11 @@ class ExperimentalWwiseFrame(ttk.Frame):
     def shutdown(self) -> None:
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
+        self.preview_task_runner.cancel()
+        self.preview_task_runner.cancel_polling()
         self._close_loading_window()
         self._cancel_media_render()
+        self._cancel_browser_render()
         self._cancel_pane_layout_callbacks()
         self.preview_player.close()
 
@@ -358,7 +384,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
         media_filter_bar = ttk.Frame(center)
         media_filter_bar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
-        for column, weight in enumerate((0, 2, 0, 1, 0, 0, 0, 1)):
+        for column, weight in enumerate((0, 2, 0, 1, 0, 0, 0, 0, 1)):
             media_filter_bar.columnconfigure(column, weight=weight)
 
         ttk.Label(media_filter_bar, text="Search").grid(row=0, column=0, sticky="w", padx=(0, 6))
@@ -385,7 +411,13 @@ class ExperimentalWwiseFrame(ttk.Frame):
         ttk.Checkbutton(media_filter_bar, text="Group similar audio", variable=self.group_similar_var).grid(
             row=0, column=6, sticky="w", padx=(0, 8)
         )
-        ttk.Label(media_filter_bar, textvariable=self.media_count_var).grid(row=0, column=7, sticky="e")
+        self.index_metadata_button = ttk.Button(
+            media_filter_bar,
+            text="Index Visible Metadata",
+            command=self._index_visible_media_metadata,
+        )
+        self.index_metadata_button.grid(row=0, column=7, sticky="ew", padx=(0, 8))
+        ttk.Label(media_filter_bar, textvariable=self.media_count_var).grid(row=0, column=8, sticky="e")
 
         media_tree_frame = ttk.Frame(center)
         media_tree_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(6, 0))
@@ -499,6 +531,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self.export_bank_button,
             self.replace_audio_button,
             self.export_dump_button,
+            self.index_metadata_button,
         ]
         self._pane_layout_after_ids.append(self.after_idle(self._ensure_default_pane_layout))
         self._pane_layout_after_ids.append(self.after(100, self._ensure_default_pane_layout))
@@ -810,6 +843,59 @@ class ExperimentalWwiseFrame(ttk.Frame):
             on_finally=self._finish_task_ui,
         )
 
+    def _run_preview_task(
+        self,
+        *,
+        start_message: str,
+        worker: Callable[[Callable[[str, float | None, float | None], None], Callable[[str], None]], PreparedPreview],
+        on_started: Callable[[PreparedPreview], None],
+    ) -> None:
+        if self.task_runner.is_running:
+            self._show_info_window("Preview media", "Wait for the current experimental workspace task to finish first.")
+            return
+        if self.preview_task_runner.is_running:
+            self._show_info_window("Preview media", "A preview is already being prepared. Use Stop to cancel it.")
+            return
+
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
+        self.preview_player.stop()
+        self.play_button.configure(state="disabled")
+        self.play_all_button.configure(state="disabled")
+        self._append_status(start_message)
+
+        def on_progress(progress: TaskProgress) -> None:
+            if request_id == self._preview_request_id:
+                self._append_status(progress.message or start_message)
+
+        def on_success(result: object) -> None:
+            if request_id != self._preview_request_id:
+                return
+            if not isinstance(result, PreparedPreview):
+                raise RuntimeError("Preview preparation returned an unexpected result.")
+            preview_path = self.preview_player.start_prepared(result, self._append_log)
+            on_started(PreparedPreview(source=preview_path, mode=result.mode))
+
+        def on_error(exc: BaseException, _details: str) -> None:
+            if request_id != self._preview_request_id or isinstance(exc, TaskCancelled):
+                return
+            self._show_error_window("Preview failed", str(exc))
+            self._append_status("Experimental preview failed.")
+
+        def on_finally() -> None:
+            self._update_preview_action_controls()
+            if not self.preview_task_runner.is_running:
+                self.play_button.configure(state="normal")
+
+        self.preview_task_runner.start(
+            worker,
+            on_progress=on_progress,
+            on_log=self._append_log,
+            on_success=on_success,
+            on_error=on_error,
+            on_finally=on_finally,
+        )
+
     def _set_text_widget(self, widget: ScrolledText, text: str) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", tk.END)
@@ -1087,6 +1173,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         )
 
     def _populate_browser_tree(self) -> None:
+        self._cancel_browser_render()
         self._cancel_media_render()
         self.browser_tree.delete(*self.browser_tree.get_children())
         self.media_tree.delete(*self.media_tree.get_children())
@@ -1101,47 +1188,70 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
         if self.workspace is None:
             return
+        # The manifest is already sorted by the builder. Populate in small Tk
+        # batches so a large archive hierarchy never blocks the event loop.
+        self._browser_render_state = BrowserRenderState(rows=list(self.workspace.named_links))
+        self.task_status_var.set("Rendering archive browser...")
+        self._browser_render_after_id = self.after_idle(self._render_browser_tree_chunk)
 
-        archive_nodes: dict[str, str] = {}
-        bank_nodes: dict[tuple[str, str], str] = {}
-        event_nodes: dict[tuple[str, str, str], str] = {}
-        first_archive_iid: str | None = None
-        grouped = sorted(self.workspace.named_links, key=lambda row: (row.archive.lower(), row.bank.lower(), row.event.lower(), row.media_id))
-        for row in grouped:
-            if row.archive not in archive_nodes:
+    def _cancel_browser_render(self) -> None:
+        if self._browser_render_after_id is not None:
+            try:
+                self.after_cancel(self._browser_render_after_id)
+            except tk.TclError:
+                pass
+        self._browser_render_after_id = None
+        self._browser_render_state = None
+
+    def _render_browser_tree_chunk(self) -> None:
+        state = self._browser_render_state
+        self._browser_render_after_id = None
+        if state is None:
+            return
+
+        end_index = min(state.index + 200, len(state.rows))
+        for row in state.rows[state.index:end_index]:
+            if row.archive not in state.archive_nodes:
                 archive_iid = f"archive::{row.archive}"
-                archive_nodes[row.archive] = archive_iid
-                if first_archive_iid is None:
-                    first_archive_iid = archive_iid
+                state.archive_nodes[row.archive] = archive_iid
+                if state.first_archive_iid is None:
+                    state.first_archive_iid = archive_iid
                 self.browser_tree.insert("", "end", iid=archive_iid, text=row.archive)
                 self.tree_node_context[archive_iid] = ("archive", row.archive, "", "")
             bank_key = (row.archive, row.bank)
-            if bank_key not in bank_nodes:
+            if bank_key not in state.bank_nodes:
                 bank_iid = f"bank::{row.archive}::{row.bank}"
-                bank_nodes[bank_key] = bank_iid
-                self.browser_tree.insert(archive_nodes[row.archive], "end", iid=bank_iid, text=row.bank)
+                state.bank_nodes[bank_key] = bank_iid
+                self.browser_tree.insert(state.archive_nodes[row.archive], "end", iid=bank_iid, text=row.bank)
                 self.tree_node_context[bank_iid] = ("bank", row.archive, row.bank, "")
             event_key = (row.archive, row.bank, row.event)
-            if event_key not in event_nodes:
+            if event_key not in state.event_nodes:
                 event_iid = f"event::{row.archive}::{row.bank}::{row.event}"
-                event_nodes[event_key] = event_iid
-                self.browser_tree.insert(bank_nodes[bank_key], "end", iid=event_iid, text=row.event)
+                state.event_nodes[event_key] = event_iid
+                self.browser_tree.insert(state.bank_nodes[bank_key], "end", iid=event_iid, text=row.event)
                 self.tree_node_context[event_iid] = ("event", row.archive, row.bank, row.event)
 
-        for archive_iid in archive_nodes.values():
-            self.browser_tree.item(archive_iid, open=True)
+        state.index = end_index
+        if state.index < len(state.rows):
+            self.task_status_var.set(f"Rendering archive browser ({state.index}/{len(state.rows)})...")
+            self._browser_render_after_id = self.after(1, self._render_browser_tree_chunk)
+            return
 
-        if first_archive_iid is not None and self.browser_tree.exists(first_archive_iid):
-            self.browser_tree.selection_set(first_archive_iid)
-            self.browser_tree.focus(first_archive_iid)
-            self.browser_tree.see(first_archive_iid)
+        for archive_iid in state.archive_nodes.values():
+            self.browser_tree.item(archive_iid, open=True)
+        self._browser_render_state = None
+        if state.first_archive_iid is not None and self.browser_tree.exists(state.first_archive_iid):
+            self.browser_tree.selection_set(state.first_archive_iid)
+            self.browser_tree.focus(state.first_archive_iid)
+            self.browser_tree.see(state.first_archive_iid)
             self._on_tree_select(None)
-        elif self.workspace.named_links:
+        elif self.workspace is not None and self.workspace.named_links:
             self.media_count_var.set(f"0 shown / {len(self.workspace.named_links)} total")
             self.details_var.set("Select an archive, bank, or event to browse media.")
         else:
             self.media_count_var.set("0 shown / 0 total")
             self.details_var.set("No named audio links were generated for this workspace.")
+        self.task_status_var.set("Experimental workspace ready.")
 
     def _rows_for_context(self, node_type: str, archive: str, bank: str, event: str) -> list[NamedAudioLink]:
         if self.workspace is None:
@@ -1174,6 +1284,30 @@ class ExperimentalWwiseFrame(ttk.Frame):
 
     def _clear_media_search(self) -> None:
         self.media_search_var.set("")
+
+    def _index_visible_media_metadata(self) -> None:
+        if self.workspace is None:
+            self._show_info_window("Index metadata", "Build the experimental workspace first.")
+            return
+        rows = list(self.visible_rows)
+        if not rows:
+            self._show_info_window("Index metadata", "Select an archive, bank, or event with media first.")
+            return
+
+        self._run_task(
+            start_message=f"Indexing metadata for {len(rows)} visible media row(s)...",
+            error_title="Index media metadata failed",
+            worker=lambda progress, _log: index_named_audio_metadata(
+                self.workspace,
+                rows,
+                progress=progress,
+                cancel_event=self.task_runner.cancel_event,
+            ),
+            on_success=lambda result: (
+                self._refresh_media_tree(),
+                self._append_status(f"Indexed metadata for {int(result) if isinstance(result, int) else 0} media source(s)."),
+            ),
+        )
 
     def _set_media_sort_field_from_heading(self, heading_title: str) -> None:
         field_map = {
@@ -1214,8 +1348,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
             row.bank,
             row.event,
             _audio_type_text(row),
-            str(duration_ms),
-            str(sample_count),
+            str(duration_ms) if duration_ms > 0 else "—",
+            str(sample_count) if sample_count > 0 else "—",
             str(row.link),
         )
 
@@ -1226,8 +1360,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
             _shared_text([row.bank for row in group.rows]),
             _shared_text([row.event for row in group.rows]),
             _shared_text([_audio_type_text(row) for row in group.rows]),
-            str(group.duration_ms),
-            str(group.sample_count),
+            str(group.duration_ms) if group.duration_ms > 0 else "—",
+            str(group.sample_count) if group.sample_count > 0 else "—",
             _media_signature_text(group.duration_ms, group.sample_count),
         )
 
@@ -1446,8 +1580,8 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 f"Audio type: {_audio_type_text(row)}",
                 f"Type note: {row.audio_type_note or 'n/a'}",
                 f"Resolved object types: {', '.join(str(value) for value in row.resolved_object_types) or 'n/a'}",
-                f"Duration: {duration_ms} ms",
-                f"Samples: {sample_count}",
+                f"Duration: {duration_ms} ms" if duration_ms > 0 else "Duration: —",
+                f"Samples: {sample_count}" if sample_count > 0 else "Samples: —",
                 f"Playable file: {row.link}",
                 f"Flat source: {row.source}",
             ]
@@ -1513,17 +1647,32 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self.play_all_button.grid()
 
     def _play_selected(self) -> None:
-        entry = self._selected_preview_entry()
-        if entry is None:
+        rows = self._selected_rows()
+        if not rows or self.workspace is None:
             self._show_info_window("Preview media", "Select a media row to preview first.")
             return
-        try:
-            preview_path = self.preview_player.play_entry(entry, self._append_status)
-        except Exception as exc:
-            self._show_error_window("Preview failed", str(exc))
-            self._append_status("Experimental preview failed.")
-            return
-        self._append_status(f"Previewing {preview_path.name}.")
+        row = rows[0]
+
+        def worker(progress, log) -> PreparedPreview:
+            source = materialize_named_audio_link(
+                self.workspace,
+                row,
+                cancel_event=self.preview_task_runner.cancel_event,
+            )
+            entry = AudioEntry(
+                entry_name=f"{row.bank}_{row.media_id}",
+                source_mode="raw",
+                source_path=str(source),
+                duration_ms=row.duration_ms,
+                sample_count=row.sample_count_48k,
+            )
+            return self.preview_player.prepare_entry(entry, log)
+
+        self._run_preview_task(
+            start_message=f"Preparing preview for media {row.media_id}...",
+            worker=worker,
+            on_started=lambda prepared: self._append_status(f"Previewing {prepared.source.name}."),
+        )
 
     def _play_selected_together(self) -> None:
         rows = self._selected_group_preview_rows()
@@ -1537,14 +1686,26 @@ class ExperimentalWwiseFrame(ttk.Frame):
             self._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
             return
 
-        sources = [row.source if row.source.exists() else row.link for row in rows]
-        try:
-            preview_path = self.preview_player.play_combined_sources(sources, self._append_status)
-        except Exception as exc:
-            self._show_error_window("Preview failed", str(exc))
-            self._append_status("Experimental group preview failed.")
+        if self.workspace is None:
+            self._show_info_window("Preview media", "Build the experimental workspace first.")
             return
-        self._append_status(f"Previewing {len(rows)} files together from {preview_path.name}.")
+
+        def worker(progress, log) -> PreparedPreview:
+            sources = materialize_named_audio_links(
+                self.workspace,
+                rows,
+                progress=progress,
+                cancel_event=self.preview_task_runner.cancel_event,
+            )
+            return self.preview_player.prepare_combined_sources(sources, log)
+
+        self._run_preview_task(
+            start_message=f"Preparing mixed preview for {len(rows)} media file(s)...",
+            worker=worker,
+            on_started=lambda prepared: self._append_status(
+                f"Previewing {len(rows)} files together from {prepared.source.name}."
+            ),
+        )
 
     def _export_selected_media_mixed(self) -> None:
         rows = self._selected_group_preview_rows()
@@ -1557,24 +1718,35 @@ class ExperimentalWwiseFrame(ttk.Frame):
         if self.preview_player.environment.ffmpeg_path is None:
             self._show_error_window("Export mixed audio failed", "FFmpeg is required to mix multiple audio files together.")
             return
+        if self.workspace is None:
+            self._show_info_window("Export mixed audio", "Build the experimental workspace first.")
+            return
 
         destination_root = self._ask_export_directory("Export mixed audio")
         if destination_root is None:
             return
         destination = destination_root / self._mixed_audio_export_name(rows)
 
+        def worker(progress, log) -> Path:
+            sources = materialize_named_audio_links(
+                self.workspace,
+                rows,
+                progress=progress,
+                cancel_event=self.task_runner.cancel_event,
+            )
+            return self.preview_player.export_combined_sources(sources, destination, log)
+
         self._run_task(
             start_message=f"Exporting mixed audio from {len(rows)} file(s)...",
             error_title="Export mixed audio failed",
-            worker=lambda _progress, log: self.preview_player.export_combined_sources(
-                [row.source if row.source.exists() else row.link for row in rows],
-                destination,
-                log,
-            ),
+            worker=worker,
             on_success=lambda result: self._append_status(f"Exported mixed audio to {result}."),
         )
 
     def _stop_preview(self) -> None:
+        self._preview_request_id += 1
+        if self.preview_task_runner.is_running:
+            self.preview_task_runner.cancel()
         self.preview_player.stop()
         self._append_status("Experimental preview stopped.")
 
@@ -1601,6 +1773,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 destination,
                 progress=progress,
                 cancel_event=self.task_runner.cancel_event,
+                workspace=self.workspace,
             ),
             on_success=lambda result: self._append_status(
                 f"Exported {len(result) if isinstance(result, list) else 0} media file(s) to {destination}."
@@ -1909,7 +2082,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
         conversion_root = self.workspace.root / "replacement_conversion"
         meta_archive_path = self._resolve_archive_path("meta")
         # Capture source paths for post-replacement preview refresh
-        row_source_paths = {r.media_id: r.source for r in replacement_rows}
+        row_source_paths = {r.media_id: r.source for r in replacement_rows if r.source.exists()}
 
         def worker(progress, log):
             normalized_path = replacement_path
@@ -1956,7 +2129,7 @@ class ExperimentalWwiseFrame(ttk.Frame):
             # preview plays the new audio instead of the old cached version.
             for item in results:
                 source_wav = row_source_paths.get(item.media_id)
-                if source_wav is not None:
+                if source_wav is not None and source_wav.exists():
                     try:
                         decode_audio_to_wav(normalized_path, source_wav, log=log)
                         log(f"Updated preview source for media {item.media_id}.")

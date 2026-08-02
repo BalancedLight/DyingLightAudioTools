@@ -30,10 +30,14 @@ class TaskProgress:
 
 
 class BackgroundTaskRunner:
-    def __init__(self, widget: tk.Misc, poll_ms: int = 60) -> None:
+    def __init__(self, widget: tk.Misc, poll_ms: int = 60, max_events_per_poll: int = 64) -> None:
         self.widget = widget
         self.poll_ms = poll_ms
+        self.max_events_per_poll = max(1, max_events_per_poll)
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._progress_lock = threading.Lock()
+        self._latest_progress: TaskProgress | None = None
+        self._progress_queued = False
         self._thread: threading.Thread | None = None
         self._after_id: str | None = None
         self._running = False
@@ -67,11 +71,21 @@ class BackgroundTaskRunner:
         self._running = True
         self._cancel_event = threading.Event()
         self._queue = queue.Queue()
+        with self._progress_lock:
+            self._latest_progress = None
+            self._progress_queued = False
 
         def emit_progress(message: str = "", current: float | None = None, total: float | None = None) -> None:
             if self._cancel_event.is_set():
                 raise TaskCancelled("Task cancelled by user.")
-            self._queue.put(("progress", TaskProgress(message=message, current=current, total=total)))
+            # Keep at most one progress notification queued. Workers can emit
+            # thousands of ticks while indexing; Tk only needs the newest one.
+            with self._progress_lock:
+                self._latest_progress = TaskProgress(message=message, current=current, total=total)
+                if self._progress_queued:
+                    return
+                self._progress_queued = True
+                self._queue.put(("progress", None))
 
         def emit_log(message: str) -> None:
             if self._cancel_event.is_set():
@@ -114,30 +128,56 @@ class BackgroundTaskRunner:
         def poll() -> None:
             self._after_id = None
             should_continue = self._running
-            while True:
+            processed = 0
+            pending_progress: TaskProgress | None = None
+
+            def deliver_progress() -> None:
+                nonlocal pending_progress
+                if pending_progress is None:
+                    return
+                invoke_callback(on_progress, pending_progress)
+                pending_progress = None
+
+            while processed < self.max_events_per_poll:
                 try:
                     event, payload = self._queue.get_nowait()
                 except queue.Empty:
                     break
 
+                processed += 1
+
                 if event == "progress":
-                    invoke_callback(on_progress, payload if isinstance(payload, TaskProgress) else TaskProgress())
+                    # A single queue token represents the latest worker update.
+                    # Take it atomically so a new tick can enqueue the next token.
+                    with self._progress_lock:
+                        pending_progress = self._latest_progress
+                        self._latest_progress = None
+                        self._progress_queued = False
                 elif event == "log" and isinstance(payload, str):
+                    deliver_progress()
                     invoke_callback(on_log, payload)
                 elif event == "success":
+                    deliver_progress()
                     invoke_callback(on_success, payload)
                 elif event == "error" and isinstance(payload, tuple):
+                    deliver_progress()
                     exc, details = payload
                     if isinstance(exc, BaseException) and isinstance(details, str):
                         invoke_callback(on_error, exc, details, report_errors=False)
                 elif event == "finally":
+                    deliver_progress()
                     self._running = False
                     should_continue = False
                     invoke_callback(on_finally)
 
+            deliver_progress()
+
             if should_continue:
                 try:
-                    self._after_id = self.widget.after(self.poll_ms, poll)
+                    # Yield immediately when there is still queued UI work, rather
+                    # than draining an unbounded queue in one Tk callback.
+                    next_delay = 0 if processed >= self.max_events_per_poll else self.poll_ms
+                    self._after_id = self.widget.after(next_delay, poll)
                 except tk.TclError:
                     self._after_id = None
                     self._running = False

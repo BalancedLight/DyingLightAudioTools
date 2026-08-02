@@ -4,8 +4,13 @@ import csv
 import hashlib
 import json
 import mmap
+import os
 import shutil
+import struct
+import subprocess
+import tempfile
 import threading
+import time
 import wave
 import xml.etree.ElementTree as ET
 from functools import lru_cache
@@ -15,7 +20,7 @@ from typing import Callable
 
 from dyingaudio.audio_info import probe_audio_metadata
 from dyingaudio.background import TaskCancelled
-from dyingaudio.core.media_tools import decode_audio_to_wav, discover_media_tools
+from dyingaudio.core.media_tools import decode_audio_to_wav, discover_media_tools, popen_hidden
 from dyingaudio.core.wwise_audio_type import (
     CONFIDENCE_UNKNOWN,
     UNKNOWN_AUDIO_TYPE,
@@ -37,7 +42,7 @@ GAME_LABELS = {
     DL2_GAME: "Dying Light 2",
     DLTB_GAME: "Dying Light The Beast",
 }
-WORKSPACE_SCHEMA_VERSION = 2
+WORKSPACE_SCHEMA_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -71,6 +76,10 @@ class NamedAudioLink:
     audio_type: str = UNKNOWN_AUDIO_TYPE
     audio_type_confidence: str = CONFIDENCE_UNKNOWN
     audio_type_note: str = ""
+    archive_offset: int = 0
+    archive_size: int = 0
+    duration_ms: int = 0
+    sample_count_48k: int = 0
 
 
 @dataclass(slots=True)
@@ -107,6 +116,10 @@ class WwiseWorkspace:
     unresolved: list[UnresolvedAudioLink]
     summary_text: str
     metadata_path: Path
+
+
+_SOURCE_LOCK_GUARD = threading.Lock()
+_SOURCE_LOCKS: dict[str, threading.Lock] = {}
 
 
 def game_label(game: str) -> str:
@@ -210,6 +223,7 @@ def workspace_root_for(cache_root: str | Path, game: str, archive_set: str, fing
 def _workspace_metadata_payload(game: str, archive_set: str, bundle: ArchiveBundle, fingerprint: str) -> dict[str, object]:
     return {
         "schema_version": WORKSPACE_SCHEMA_VERSION,
+        "complete": True,
         "game": game,
         "archive_set": archive_set,
         "fingerprint": fingerprint,
@@ -308,6 +322,282 @@ def warm_media_signature_cache(
     return len(unique_paths)
 
 
+def _archive_path_for_row(workspace: WwiseWorkspace, row: NamedAudioLink) -> Path:
+    paths = {
+        "meta": workspace.archive_bundle.meta_path,
+        "sfx": workspace.archive_bundle.sfx_path,
+        "streams": workspace.archive_bundle.streams_path,
+    }
+    archive_path = paths.get(row.archive)
+    if archive_path is None:
+        raise ValueError(f"Unsupported Wwise archive '{row.archive}'.")
+    if not archive_path.exists():
+        raise FileNotFoundError(f"Missing Wwise archive: {archive_path}")
+    return archive_path
+
+
+def _source_lock_for(path: Path) -> threading.Lock:
+    key = str(path.resolve()).casefold()
+    with _SOURCE_LOCK_GUARD:
+        lock = _SOURCE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SOURCE_LOCKS[key] = lock
+        return lock
+
+
+def _read_archived_wem_bytes(workspace: WwiseWorkspace, row: NamedAudioLink) -> bytes:
+    if row.archive_offset < 0:
+        raise ValueError(f"Invalid archive offset for media {row.media_id}.")
+    archive_path = _archive_path_for_row(workspace, row)
+    archive_size = archive_path.stat().st_size
+    if row.archive_offset + 12 > archive_size:
+        raise ValueError(f"Media {row.media_id} starts outside {archive_path.name}.")
+
+    with archive_path.open("rb") as handle:
+        handle.seek(row.archive_offset)
+        header = handle.read(12)
+        if len(header) != 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            raise ValueError(f"Media {row.media_id} in {archive_path.name} is not RIFF/WAVE audio.")
+        riff_size = struct.unpack_from("<I", header, 4)[0] + 8
+        if riff_size < 12 or row.archive_offset + riff_size > archive_size:
+            raise ValueError(f"Media {row.media_id} has an invalid RIFF length in {archive_path.name}.")
+        handle.seek(row.archive_offset)
+        payload = handle.read(riff_size)
+    if len(payload) != riff_size:
+        raise RuntimeError(f"Could not read all bytes for media {row.media_id} from {archive_path.name}.")
+    return payload
+
+
+def _write_temporary_archived_wem(workspace: WwiseWorkspace, row: NamedAudioLink) -> Path:
+    temp_root = workspace.logs_root / "temp_decode"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f"{row.archive}_{row.archive_offset:010X}_",
+        suffix=".wem",
+        dir=str(temp_root),
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_read_archived_wem_bytes(workspace, row))
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+    return Path(temp_name)
+
+
+def _ensure_row_link(row: NamedAudioLink) -> Path:
+    if row.link.exists():
+        return row.link
+    row.link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(row.source, row.link)
+    except FileExistsError:
+        pass
+    except OSError:
+        if not row.link.exists():
+            shutil.copy2(row.source, row.link)
+    return row.link if row.link.exists() else row.source
+
+
+def _decode_wem_to_source(
+    source_wem: Path,
+    destination: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    tools = discover_media_tools()
+    if tools.vgmstream_path is None:
+        raise RuntimeError("vgmstream is required to decode Wwise media on demand.")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_destination = destination.with_name(f".{destination.name}.{threading.get_ident()}.tmp")
+    temporary_destination.unlink(missing_ok=True)
+    process = popen_hidden(
+        [str(tools.vgmstream_path), "-o", str(temporary_destination), str(source_wem)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                raise TaskCancelled()
+            time.sleep(0.05)
+        if process.returncode != 0 or not temporary_destination.exists():
+            raise RuntimeError(f"vgmstream could not decode '{source_wem.name}'.")
+        temporary_destination.replace(destination)
+        return destination
+    finally:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        temporary_destination.unlink(missing_ok=True)
+
+
+def _apply_link_signature(workspace: WwiseWorkspace, row: NamedAudioLink, duration_ms: int, sample_count_48k: int) -> None:
+    for candidate in workspace.named_links:
+        if (
+            candidate.archive == row.archive
+            and candidate.archive_offset == row.archive_offset
+            and candidate.source == row.source
+        ):
+            candidate.duration_ms = max(duration_ms, 0)
+            candidate.sample_count_48k = max(sample_count_48k, 0)
+
+
+def _named_link_manifest_fieldnames() -> tuple[str, ...]:
+    return (
+        "archive",
+        "bank",
+        "event",
+        "media_id",
+        "source",
+        "link",
+        "object_types",
+        "audio_type",
+        "audio_type_confidence",
+        "audio_type_note",
+        "archive_offset",
+        "archive_size",
+        "duration_ms",
+        "sample_count_48k",
+    )
+
+
+def _persist_named_link_manifest(workspace: WwiseWorkspace) -> None:
+    manifest_path = workspace.logs_root / "named_tree_manifest.csv"
+    if not manifest_path.exists():
+        return
+    temporary_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_named_link_manifest_fieldnames())
+        writer.writeheader()
+        for row in workspace.named_links:
+            writer.writerow(
+                {
+                    "archive": row.archive,
+                    "bank": row.bank,
+                    "event": row.event,
+                    "media_id": row.media_id,
+                    "source": row.source,
+                    "link": row.link,
+                    "object_types": "|".join(str(value) for value in row.resolved_object_types),
+                    "audio_type": row.audio_type,
+                    "audio_type_confidence": row.audio_type_confidence,
+                    "audio_type_note": row.audio_type_note,
+                    "archive_offset": row.archive_offset,
+                    "archive_size": row.archive_size,
+                    "duration_ms": row.duration_ms,
+                    "sample_count_48k": row.sample_count_48k,
+                }
+            )
+    temporary_path.replace(manifest_path)
+
+
+def materialize_named_audio_link(
+    workspace: WwiseWorkspace,
+    row: NamedAudioLink,
+    *,
+    cancel_event: threading.Event | None = None,
+    persist_metadata: bool = True,
+) -> Path:
+    """Decode one archived Wwise media item only when a caller needs it."""
+    _raise_if_cancelled(cancel_event)
+    source_lock = _source_lock_for(row.source)
+    with source_lock:
+        _raise_if_cancelled(cancel_event)
+        needs_decode = not row.source.exists() or row.source.stat().st_size <= 44
+        if not needs_decode:
+            existing_duration_ms, existing_sample_count = media_signature_for_path(str(row.source))
+            needs_decode = existing_duration_ms <= 0 and existing_sample_count <= 0
+        if needs_decode:
+            temporary_wem = _write_temporary_archived_wem(workspace, row)
+            try:
+                _decode_wem_to_source(temporary_wem, row.source, cancel_event=cancel_event)
+            finally:
+                temporary_wem.unlink(missing_ok=True)
+            media_signature_for_path.cache_clear()
+
+    materialized = _ensure_row_link(row)
+    duration_ms, sample_count_48k = media_signature_for_path(str(row.source))
+    if duration_ms > 0 or sample_count_48k > 0:
+        _apply_link_signature(workspace, row, duration_ms, sample_count_48k)
+        if persist_metadata:
+            _persist_named_link_manifest(workspace)
+    return materialized
+
+
+def materialize_named_audio_links(
+    workspace: WwiseWorkspace,
+    rows: list[NamedAudioLink],
+    *,
+    progress: Callable[[str, float | None, float | None], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[Path]:
+    materialized: list[Path] = []
+    total = max(len(rows), 1)
+    for index, row in enumerate(rows):
+        _raise_if_cancelled(cancel_event)
+        materialized.append(
+            materialize_named_audio_link(
+                workspace,
+                row,
+                cancel_event=cancel_event,
+                persist_metadata=False,
+            )
+        )
+        if progress is not None:
+            progress(f"Preparing media {index + 1}/{len(rows)}...", index + 1, total)
+    _persist_named_link_manifest(workspace)
+    return materialized
+
+
+def index_named_audio_metadata(
+    workspace: WwiseWorkspace,
+    rows: list[NamedAudioLink],
+    *,
+    progress: Callable[[str, float | None, float | None], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    """Probe visible archived media without bulk-decoding it to WAV files."""
+    indexed = 0
+    seen_sources: set[tuple[str, int, str]] = set()
+    unique_rows: list[NamedAudioLink] = []
+    for row in rows:
+        key = (row.archive, row.archive_offset, str(row.source))
+        if key not in seen_sources:
+            seen_sources.add(key)
+            unique_rows.append(row)
+
+    total = max(len(unique_rows), 1)
+    for index, row in enumerate(unique_rows):
+        _raise_if_cancelled(cancel_event)
+        duration_ms = sample_count_48k = 0
+        if row.source.exists():
+            duration_ms, sample_count_48k = media_signature_for_path(str(row.source))
+        else:
+            temporary_wem = _write_temporary_archived_wem(workspace, row)
+            try:
+                metadata = probe_audio_metadata(temporary_wem)
+                duration_ms = metadata.duration_ms
+                sample_count_48k = metadata.sample_count_48k
+            finally:
+                temporary_wem.unlink(missing_ok=True)
+        if duration_ms > 0 or sample_count_48k > 0:
+            _apply_link_signature(workspace, row, duration_ms, sample_count_48k)
+            indexed += 1
+        if progress is not None:
+            progress(f"Indexing media metadata {index + 1}/{len(unique_rows)}...", index + 1, total)
+    _persist_named_link_manifest(workspace)
+    return indexed
+
+
 def _load_named_links(path: Path, archive_set: str) -> list[NamedAudioLink]:
     if not path.exists():
         return []
@@ -326,6 +616,10 @@ def _load_named_links(path: Path, archive_set: str) -> list[NamedAudioLink]:
                 audio_type=str(row.get("audio_type", UNKNOWN_AUDIO_TYPE) or UNKNOWN_AUDIO_TYPE),
                 audio_type_confidence=str(row.get("audio_type_confidence", CONFIDENCE_UNKNOWN) or CONFIDENCE_UNKNOWN),
                 audio_type_note=str(row.get("audio_type_note", "") or ""),
+                archive_offset=_parse_int(row.get("archive_offset")),
+                archive_size=_parse_int(row.get("archive_size")),
+                duration_ms=_parse_int(row.get("duration_ms")),
+                sample_count_48k=_parse_int(row.get("sample_count_48k")),
             )
             _decorate_named_link_audio_type(link, archive_set)
             entries.append(link)
@@ -433,7 +727,10 @@ def build_or_load_workspace(
     if metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            metadata_current = int(metadata.get("schema_version", 0)) == WORKSPACE_SCHEMA_VERSION
+            metadata_current = (
+                int(metadata.get("schema_version", 0)) == WORKSPACE_SCHEMA_VERSION
+                and metadata.get("complete") is True
+            )
         except (OSError, TypeError, ValueError):
             metadata_current = False
 
@@ -446,24 +743,24 @@ def build_or_load_workspace(
     ):
         if progress is not None:
             progress("Loading cached workspace...", 4, 5)
-        workspace = load_workspace(workspace_root)
-        warm_media_signature_cache(workspace.named_links, progress=progress, cancel_event=cancel_event)
-        return workspace
+        return load_workspace(workspace_root)
 
     workspace_root.mkdir(parents=True, exist_ok=True)
     tree_root.mkdir(parents=True, exist_ok=True)
     banks_root.mkdir(parents=True, exist_ok=True)
     logs_root.mkdir(parents=True, exist_ok=True)
+    # ``workspace.json`` is the completion marker. Remove any old or stale
+    # marker before rebuilding so a cancelled build can never be loaded as a
+    # cache hit. Existing decoded media remains available for reuse.
+    metadata_path.unlink(missing_ok=True)
+    metadata_temp_path = metadata_path.with_name(f"{metadata_path.name}.tmp")
+    metadata_temp_path.unlink(missing_ok=True)
     try:
         if progress is not None:
             progress("Extracting embedded mapping XML...", 1, 5)
         write_mapping_xml(bundle.meta_path, mapping_xml_path)
         _raise_if_cancelled(cancel_event)
 
-        tools = discover_media_tools()
-        if tools.vgmstream_path is None and builder is None:
-            raise RuntimeError("vgmstream is required to build the experimental Wwise workspace.")
-        vgmstream_cli_path = tools.vgmstream_path or Path("vgmstream-cli.exe")
         if progress is not None:
             progress("Generating named audio tree in Python...", 2, 5)
         if builder is None:
@@ -477,7 +774,6 @@ def build_or_load_workspace(
                 xml_file=mapping_xml_path,
                 tree_root=tree_root,
                 banks_root=banks_root,
-                vgmstream_cli_path=vgmstream_cli_path,
                 log=log,
                 progress=progress,
                 cancel_event=cancel_event,
@@ -491,25 +787,29 @@ def build_or_load_workspace(
                 xml_file=mapping_xml_path,
                 tree_root=tree_root,
                 banks_root=banks_root,
-                vgmstream_cli_path=vgmstream_cli_path,
+                # Kept for custom legacy builders; the built-in indexer no
+                # longer needs a decoder during workspace construction.
+                vgmstream_cli_path=discover_media_tools().vgmstream_path or Path("vgmstream-cli.exe"),
                 log=log,
                 progress=progress,
             )
     except TaskCancelled:
-        shutil.rmtree(workspace_root, ignore_errors=True)
+        metadata_temp_path.unlink(missing_ok=True)
+        raise
+    except BaseException:
+        metadata_temp_path.unlink(missing_ok=True)
         raise
     _raise_if_cancelled(cancel_event)
     if progress is not None:
         progress("Writing workspace metadata...", 4, 5)
-    metadata_path.write_text(
+    metadata_temp_path.write_text(
         json.dumps(_workspace_metadata_payload(game, archive_set, bundle, fingerprint), indent=2),
         encoding="utf-8",
     )
+    metadata_temp_path.replace(metadata_path)
     if progress is not None:
         progress("Loading generated workspace...", 5, 5)
-    workspace = load_workspace(workspace_root)
-    warm_media_signature_cache(workspace.named_links, progress=progress, cancel_event=cancel_event)
-    return workspace
+    return load_workspace(workspace_root)
 
 
 def _iter_files(root: Path) -> list[Path]:
@@ -527,6 +827,14 @@ def export_workspace_dump(
     destination = destination_root_path / f"{workspace.game.lower()}_{workspace.archive_set}_{workspace.fingerprint}"
     if destination.exists():
         shutil.rmtree(destination)
+    # A full dump is the explicit opt-in bulk operation. Make all named media
+    # available before copying the workspace so the exported tree is complete.
+    materialize_named_audio_links(
+        workspace,
+        workspace.named_links,
+        progress=progress,
+        cancel_event=cancel_event,
+    )
     files = _iter_files(workspace.root)
     total = max(len(files), 1)
     for index, source in enumerate(files):
@@ -545,6 +853,7 @@ def export_media_files(
     destination_root: str | Path,
     progress: Callable[[str, float | None, float | None], None] | None = None,
     cancel_event: threading.Event | None = None,
+    workspace: WwiseWorkspace | None = None,
 ) -> list[Path]:
     destination_root_path = Path(destination_root).resolve()
     destination_root_path.mkdir(parents=True, exist_ok=True)
@@ -554,7 +863,10 @@ def export_media_files(
     total = max(len(rows), 1)
     for index, row in enumerate(rows):
         _raise_if_cancelled(cancel_event)
-        source = row.link if row.link.exists() else row.source
+        if workspace is not None:
+            source = materialize_named_audio_link(workspace, row, cancel_event=cancel_event)
+        else:
+            source = row.link if row.link.exists() else row.source
         destination = destination_root_path / _named_audio_export_name(row, used_names)
         decode_audio_to_wav(source, destination, tools=tools)
         exported.append(destination)
@@ -597,25 +909,33 @@ def export_event_folder(
     progress: Callable[[str, float | None, float | None], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
-    source = event_directory(workspace, archive, bank, event)
-    if not source.exists():
-        raise FileNotFoundError(f"Event folder does not exist: {source}")
     destination_root_path = Path(destination_root).resolve()
     destination_root_path.mkdir(parents=True, exist_ok=True)
     destination = destination_root_path / archive / bank / event
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         shutil.rmtree(destination)
-    files = _iter_files(source)
-    total = max(len(files), 1)
-    for index, source_file in enumerate(files):
+    rows = [
+        row
+        for row in workspace.named_links
+        if row.archive == archive and row.bank == bank and row.event == event
+    ]
+    if not rows:
+        raise FileNotFoundError(f"No named media exists for event: {archive} / {bank} / {event}")
+    source_files = materialize_named_audio_links(
+        workspace,
+        rows,
+        progress=progress,
+        cancel_event=cancel_event,
+    )
+    total = max(len(source_files), 1)
+    for index, source_file in enumerate(source_files):
         _raise_if_cancelled(cancel_event)
-        relative = source_file.relative_to(source)
-        target = destination / relative
+        target = destination / source_file.name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_file, target)
         if progress is not None:
-            progress(f"Exporting {relative}", index + 1, total)
+            progress(f"Exporting {source_file.name}", index + 1, total)
     return destination
 
 

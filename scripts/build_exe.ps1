@@ -80,6 +80,29 @@ function Test-TkBuildReady {
     }
 }
 
+function Ensure-PyInstaller {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $PythonExe
+    )
+
+    & $PythonExe -c "import PyInstaller" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-Host "PyInstaller is not installed for $PythonExe; installing it now..."
+    & $PythonExe -m pip install --upgrade pyinstaller
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not install PyInstaller for $PythonExe. Ensure pip can install packages for this Python interpreter, then run the build again."
+    }
+
+    & $PythonExe -c "import PyInstaller"
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller was installed but is not importable from $PythonExe."
+    }
+}
+
 function Get-TkEnvironment {
     $roots = @()
 
@@ -191,6 +214,8 @@ if ([string]::IsNullOrWhiteSpace($pythonExe)) {
     }
     $pythonExe = Get-CommandPath -CommandInfo $pythonCmd
 }
+
+Ensure-PyInstaller -PythonExe $pythonExe
 
 $tkEnv = Get-TkEnvironment
 if ($null -ne $tkEnv) {

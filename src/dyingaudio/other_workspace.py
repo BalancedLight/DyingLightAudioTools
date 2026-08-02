@@ -31,7 +31,7 @@ from dyingaudio.core.pck_workspace import (
     scan_pck_root,
     workspace_details_text,
 )
-from dyingaudio.core.preview import PreviewPlayer
+from dyingaudio.core.preview import PreparedPreview, PreviewPlayer
 from dyingaudio.core.wwise_audio_type import MUSIC_TRACK_AUDIO_TYPE, SOUND_VOICE_AUDIO_TYPE, UNKNOWN_AUDIO_TYPE, audio_type_label
 from dyingaudio.models import AudioEntry
 from dyingaudio.popups import ask_yes_no_cancel_dialog, ask_yes_no_dialog, show_error_dialog, show_info_dialog, show_warning_dialog
@@ -189,6 +189,8 @@ class OtherWorkspaceFrame(ttk.Frame):
         self.media_iid_rows: dict[str, list[PckAudioRow]] = {}
         self.media_group_iids: set[str] = set()
         self.task_runner = BackgroundTaskRunner(self)
+        self.preview_task_runner = BackgroundTaskRunner(self)
+        self._preview_request_id = 0
         self._ui_busy = False
         self._busy_widgets: list[tk.Widget] = []
         self.loading_window: tk.Toplevel | None = None
@@ -254,6 +256,8 @@ class OtherWorkspaceFrame(ttk.Frame):
     def shutdown(self) -> None:
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
+        self.preview_task_runner.cancel()
+        self.preview_task_runner.cancel_polling()
         if self._pack_select_after_id is not None:
             try:
                 self.after_cancel(self._pack_select_after_id)
@@ -935,6 +939,59 @@ class OtherWorkspaceFrame(ttk.Frame):
             on_finally=self._finish_task_ui,
         )
 
+    def _run_preview_task(
+        self,
+        *,
+        start_message: str,
+        worker: Callable[[Callable[[str, float | None, float | None], None], Callable[[str], None]], PreparedPreview],
+        on_started: Callable[[PreparedPreview], None],
+    ) -> None:
+        if self.task_runner.is_running:
+            self._show_info_window("Preview media", "Wait for the current Other workspace task to finish first.")
+            return
+        if self.preview_task_runner.is_running:
+            self._show_info_window("Preview media", "A preview is already being prepared. Use Stop to cancel it.")
+            return
+
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
+        self.preview_player.stop()
+        self.play_button.configure(state="disabled")
+        self.play_all_button.configure(state="disabled")
+        self._append_status(start_message)
+
+        def on_progress(progress: TaskProgress) -> None:
+            if request_id == self._preview_request_id:
+                self._append_status(progress.message or start_message)
+
+        def on_success(result: object) -> None:
+            if request_id != self._preview_request_id:
+                return
+            if not isinstance(result, PreparedPreview):
+                raise RuntimeError("Preview preparation returned an unexpected result.")
+            preview_path = self.preview_player.start_prepared(result, self._append_log)
+            on_started(PreparedPreview(source=preview_path, mode=result.mode))
+
+        def on_error(exc: BaseException, _details: str) -> None:
+            if request_id != self._preview_request_id or isinstance(exc, TaskCancelled):
+                return
+            self._show_error_window("Preview failed", str(exc))
+            self._append_status("Other preview failed.")
+
+        def on_finally() -> None:
+            self._update_preview_action_controls()
+            if not self.preview_task_runner.is_running:
+                self.play_button.configure(state="normal")
+
+        self.preview_task_runner.start(
+            worker,
+            on_progress=on_progress,
+            on_log=self._append_log,
+            on_success=on_success,
+            on_error=on_error,
+            on_finally=on_finally,
+        )
+
     def _resolve_root(self) -> Path | None:
         current = self.root_var.get().strip()
         if not current:
@@ -1481,13 +1538,11 @@ class OtherWorkspaceFrame(ttk.Frame):
         if entry is None:
             self._show_info_window("Preview media", "Select a media row to preview first.")
             return
-        try:
-            preview_path = self.preview_player.play_entry(entry, self._append_status)
-        except Exception as exc:
-            self._show_error_window("Preview failed", str(exc))
-            self._append_status("Other preview failed.")
-            return
-        self._append_status(f"Previewing {preview_path.name}.")
+        self._run_preview_task(
+            start_message=f"Preparing preview for {entry.entry_name}...",
+            worker=lambda _progress, log: self.preview_player.prepare_entry(entry, log),
+            on_started=lambda prepared: self._append_status(f"Previewing {prepared.source.name}."),
+        )
 
     def _play_selected_together(self) -> None:
         rows = self._selected_group_preview_rows()
@@ -1497,15 +1552,19 @@ class OtherWorkspaceFrame(ttk.Frame):
         if self.preview_player.environment.ffmpeg_path is None:
             self._show_error_window("Preview failed", "FFmpeg is required to mix multiple audio files together.")
             return
-        try:
-            preview_path = self.preview_player.play_combined_sources([row.cached_path for row in rows], self._append_status)
-        except Exception as exc:
-            self._show_error_window("Preview failed", str(exc))
-            self._append_status("Other group preview failed.")
-            return
-        self._append_status(f"Previewing {len(rows)} files together from {preview_path.name}.")
+        sources = [row.cached_path for row in rows]
+        self._run_preview_task(
+            start_message=f"Preparing mixed preview for {len(rows)} media file(s)...",
+            worker=lambda _progress, log: self.preview_player.prepare_combined_sources(sources, log),
+            on_started=lambda prepared: self._append_status(
+                f"Previewing {len(rows)} files together from {prepared.source.name}."
+            ),
+        )
 
     def _stop_preview(self) -> None:
+        self._preview_request_id += 1
+        if self.preview_task_runner.is_running:
+            self.preview_task_runner.cancel()
         self.preview_player.stop()
         self._append_status("Other preview stopped.")
 

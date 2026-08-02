@@ -33,7 +33,7 @@ from dyingaudio.core.media_tools import (
 )
 from dyingaudio.core.mod_writer import build_csb_file, build_mod
 from dyingaudio.core.windows_shell import register_csb_open_with, unregister_csb_open_with
-from dyingaudio.core.preview import PreviewPlayer, preview_strategy_for_entry
+from dyingaudio.core.preview import PreparedPreview, PreviewPlayer, preview_strategy_for_entry
 from dyingaudio.core.scriptgen import generate_audiodata_scr
 from dyingaudio.core.spb import SpeechBuildOptions
 from dyingaudio.experimental_workspace import ExperimentalWwiseFrame
@@ -144,6 +144,8 @@ class DyingAudioApp(tk.Tk):
         self.preview_player = PreviewPlayer()
         self.preview_player.environment = discover_media_tools(self.settings.tools)
         self.task_runner = BackgroundTaskRunner(self)
+        self.preview_task_runner = BackgroundTaskRunner(self)
+        self._preview_request_id = 0
         self._dark_theme_colors: dict[str, str] | None = None
 
         self.mod_name_var = tk.StringVar(value=self.settings.mod_name or DEFAULT_MOD_NAME)
@@ -995,10 +997,12 @@ class DyingAudioApp(tk.Tk):
         ttk.Label(preview_frame, textvariable=self.preview_info_var, wraplength=420).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=6, pady=6
         )
-        ttk.Button(preview_frame, text="Play Selected", command=self._play_selected_entry).grid(
+        self.play_selected_button = ttk.Button(preview_frame, text="Play Selected", command=self._play_selected_entry)
+        self.play_selected_button.grid(
             row=1, column=0, sticky="ew", padx=6, pady=(0, 6)
         )
-        ttk.Button(preview_frame, text="Stop", command=self._stop_preview).grid(
+        self.stop_preview_button = ttk.Button(preview_frame, text="Stop", command=self._stop_preview)
+        self.stop_preview_button.grid(
             row=1, column=1, sticky="ew", padx=6, pady=(0, 6)
         )
         self.preview_progress = ttk.Progressbar(
@@ -1924,10 +1928,11 @@ class DyingAudioApp(tk.Tk):
                 self.preview_progress.stop()
                 self._preview_indeterminate = False
             self.preview_progress.configure(mode="determinate")
-            progress = min(100.0, max(0.0, (elapsed_ms * 100.0) / duration_ms))
+            displayed_elapsed_ms = min(max(elapsed_ms, 0), duration_ms)
+            progress = min(100.0, max(0.0, (displayed_elapsed_ms * 100.0) / duration_ms))
             self.playback_progress_var.set(progress)
             self.playback_status_var.set(
-                f"Playing {self._preview_entry_name}: {self._format_preview_time(elapsed_ms)} / "
+                f"Playing {self._preview_entry_name}: {self._format_preview_time(displayed_elapsed_ms)} / "
                 f"{self._format_preview_time(duration_ms)}"
             )
             if self._preview_playback_kind != "process" and elapsed_ms >= duration_ms:
@@ -3809,23 +3814,62 @@ class DyingAudioApp(tk.Tk):
             self._show_info_window("Preview audio", "Select an entry to preview first.")
             return
 
-        entry = self.entries[selected_indices[0]]
-        try:
-            preview_path = self.preview_player.play_entry(entry, self._append_log)
-        except Exception as exc:
-            self._show_error_window("Preview failed", str(exc))
-            self.status_var.set("Preview failed.")
-            self._append_log(f"ERROR: {exc}")
+        if self.preview_task_runner.is_running:
+            self._show_info_window("Preview audio", "A preview is already being prepared. Use Stop to cancel it.")
             return
 
-        self._begin_preview_progress(entry)
-        if len(selected_indices) == 1:
-            self.status_var.set(f"Previewing '{entry.entry_name}'.")
-        else:
-            self.status_var.set(f"Previewing '{entry.entry_name}' from the current multi-selection.")
-        self._append_log(f"Previewing {entry.entry_name} from {preview_path}")
+        entry = self.entries[selected_indices[0]]
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
+        self.preview_player.stop()
+        self._reset_preview_progress(f"Preparing {entry.entry_name}...")
+        self.preview_progress.configure(mode="indeterminate")
+        self.preview_progress.start(15)
+        self._preview_indeterminate = True
+        self.play_selected_button.configure(state="disabled")
+        self.status_var.set(f"Preparing preview for '{entry.entry_name}'...")
+
+        def worker(_progress, log) -> PreparedPreview:
+            return self.preview_player.prepare_entry(entry, log)
+
+        def on_success(result: object) -> None:
+            if request_id != self._preview_request_id:
+                return
+            if not isinstance(result, PreparedPreview):
+                raise RuntimeError("Preview preparation returned an unexpected result.")
+            preview_path = self.preview_player.start_prepared(result, self._append_log)
+            self._begin_preview_progress(entry)
+            if len(selected_indices) == 1:
+                self.status_var.set(f"Previewing '{entry.entry_name}'.")
+            else:
+                self.status_var.set(f"Previewing '{entry.entry_name}' from the current multi-selection.")
+            self._append_log(f"Previewing {entry.entry_name} from {preview_path}")
+
+        def on_error(exc: BaseException, details: str) -> None:
+            if request_id != self._preview_request_id or isinstance(exc, TaskCancelled):
+                return
+            self._show_error_window("Preview failed", str(exc))
+            self.status_var.set("Preview failed.")
+            self._append_log(f"ERROR: {details.rstrip()}")
+            self._reset_preview_progress("Preview failed.")
+
+        def on_finally() -> None:
+            self.play_selected_button.configure(state="normal")
+            if request_id == self._preview_request_id and not self._preview_playing:
+                self._reset_preview_progress("Playback idle.")
+
+        self.preview_task_runner.start(
+            worker,
+            on_log=self._append_log,
+            on_success=on_success,
+            on_error=on_error,
+            on_finally=on_finally,
+        )
 
     def _stop_preview(self) -> None:
+        self._preview_request_id += 1
+        if self.preview_task_runner.is_running:
+            self.preview_task_runner.cancel()
         self.preview_player.stop()
         self._reset_preview_progress("Preview stopped.")
         self.status_var.set("Preview stopped.")
@@ -3987,6 +4031,10 @@ class DyingAudioApp(tk.Tk):
         self._save_settings()
         self.task_runner.cancel()
         self.task_runner.cancel_polling()
+        preview_task_runner = getattr(self, "preview_task_runner", None)
+        if preview_task_runner is not None:
+            preview_task_runner.cancel()
+            preview_task_runner.cancel_polling()
         self._close_loading_window()
         self.preview_player.close()
         if self.experimental_frame is not None:

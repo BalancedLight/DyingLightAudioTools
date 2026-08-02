@@ -5,7 +5,6 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 import shutil
 import struct
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -15,7 +14,6 @@ import threading
 from typing import Callable
 
 from dyingaudio.background import TaskCancelled
-from dyingaudio.core.media_tools import run_hidden
 from dyingaudio.core.wwise_audio_type import infer_audio_type, normalize_object_types
 from dyingaudio.core.wwise_workspace import ExtractedBank, NamedAudioLink, UnresolvedAudioLink
 
@@ -110,20 +108,6 @@ def _linking_delay_message(base_message: str) -> str:
 
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def create_hard_link_safe(path: Path, target: Path) -> None:
-    if path.exists():
-        return
-    ensure_directory(path.parent)
-    try:
-        os.link(target, path)
-    except FileExistsError:
-        return
-    except OSError:
-        if path.exists():
-            return
-        shutil.copy2(target, path)
 
 
 def write_file_slice(source_path: Path, offset: int, length: int, destination_path: Path) -> None:
@@ -555,57 +539,6 @@ def get_bank_media_links(
     return links
 
 
-def ensure_decoded_flat_source(
-    info: MediaInfo,
-    archive_files: dict[str, Path],
-    vgmstream_cli_path: Path,
-    temp_root: Path,
-    cancel_event: threading.Event | None = None,
-) -> bool:
-    _raise_if_cancelled(cancel_event)
-    if info.source.exists():
-        return True
-    archive_path = archive_files.get(info.archive)
-    if archive_path is None or not archive_path.exists() or not vgmstream_cli_path.exists():
-        return False
-
-    ensure_directory(info.source.parent)
-    ensure_directory(temp_root)
-    with archive_path.open("rb") as handle:
-        handle.seek(info.offset)
-        header = handle.read(12)
-        if len(header) != 12:
-            return False
-        if header[:4] != b"RIFF":
-            info.non_audio = True
-            return False
-        if header[8:12] != b"WAVE":
-            info.non_audio = True
-            return False
-        riff_size = struct.unpack_from("<I", header, 4)[0] + 8
-        handle.seek(info.offset)
-        riff_bytes = handle.read(riff_size)
-        if len(riff_bytes) != riff_size:
-            return False
-
-    temp_input = temp_root / f"{info.archive}_{info.offset:010X}.wem"
-    try:
-        temp_input.write_bytes(riff_bytes)
-        _raise_if_cancelled(cancel_event)
-        result = run_hidden(
-            [str(vgmstream_cli_path), "-o", str(info.source), str(temp_input)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        _raise_if_cancelled(cancel_event)
-        return result.returncode == 0 and info.source.exists()
-    finally:
-        temp_input.unlink(missing_ok=True)
-
-
 def parse_mapping_xml(xml_path: Path) -> tuple[dict[str, PreloadInfo], dict[int, list[str]], dict[int, str]]:
     root = ET.fromstring(xml_path.read_text(encoding="utf-8"))
     preloads_by_name: dict[str, PreloadInfo] = {}
@@ -748,7 +681,6 @@ def build_named_audio_tree(
     xml_file: Path,
     tree_root: Path,
     banks_root: Path,
-    vgmstream_cli_path: Path,
     log: LogCallback,
     progress: ProgressCallback | None = None,
     include_banks: list[str] | None = None,
@@ -756,7 +688,6 @@ def build_named_audio_tree(
 ) -> WorkspaceBuildResult:
     started = time.monotonic()
     logs_root = audio_root / "logs"
-    temp_decode_root = logs_root / "temp_decode"
     if banks_root.exists():
         shutil.rmtree(banks_root)
     if tree_root.exists():
@@ -785,8 +716,6 @@ def build_named_audio_tree(
         progress=progress,
         cancel_event=cancel_event,
     )
-    archive_files = {"meta": meta_file, "sfx": sfx_file, "streams": streams_file}
-
     extracted_banks: list[ExtractedBank] = []
     named_links: list[NamedAudioLink] = []
     unresolved: list[UnresolvedAudioLink] = []
@@ -832,18 +761,8 @@ def build_named_audio_tree(
         else:
             progress("No named media banks to link.", total_banks, total_banks)
 
-    source_lock_guard = threading.Lock()
-    source_locks: dict[Path, threading.Lock] = {}
     active_bank_guard = threading.Lock()
     active_banks: set[str] = set()
-
-    def source_lock_for(path: Path) -> threading.Lock:
-        with source_lock_guard:
-            lock = source_locks.get(path)
-            if lock is None:
-                lock = threading.Lock()
-                source_locks[path] = lock
-            return lock
 
     def active_bank_name(bank: ParsedBank, bank_index: int) -> str:
         return bank.name or f"bank_{bank_index + 1}"
@@ -882,42 +801,11 @@ def build_named_audio_tree(
                 for archive_name, archive_group in grouped_by_archive.items():
                     _raise_if_cancelled(cancel_event)
                     event_dir = tree_root / archive_name / bank_folder / event_folder
-                    event_dir_created = False
                     sorted_media = sorted(archive_group, key=lambda item: item[2])
                     for media_index, (_, _, media_id, info, object_types) in enumerate(sorted_media):
                         _raise_if_cancelled(cancel_event)
                         leaf = f"media_{media_id}.wav" if len(sorted_media) == 1 else f"{media_index + 1:03d}__media_{media_id}.wav"
                         target_path = event_dir / leaf
-                        if not info.source.exists():
-                            lock = source_lock_for(info.source)
-                            with lock:
-                                _raise_if_cancelled(cancel_event)
-                                if not info.non_audio and not info.source.exists():
-                                    restored = ensure_decoded_flat_source(
-                                        info,
-                                        archive_files,
-                                        vgmstream_cli_path,
-                                        temp_decode_root,
-                                        cancel_event=cancel_event,
-                                    )
-                                    if restored:
-                                        info.exists = True
-                        if info.non_audio:
-                            continue
-                        if not info.source.exists():
-                            bank_unresolved.append(
-                                UnresolvedAudioLink(
-                                    bank=bank_name,
-                                    event=event_name,
-                                    media_id=media_id,
-                                    note=f"Missing flat source file: {info.source}",
-                                )
-                            )
-                            continue
-                        if not event_dir_created:
-                            ensure_directory(event_dir)
-                            event_dir_created = True
-                        create_hard_link_safe(target_path, info.source)
                         resolution = infer_audio_type(
                             object_types=object_types,
                             archive_name=archive_name,
@@ -936,6 +824,8 @@ def build_named_audio_tree(
                                 audio_type=resolution.audio_type,
                                 audio_type_confidence=resolution.confidence,
                                 audio_type_note=resolution.note,
+                                archive_offset=info.offset,
+                                archive_size=info.size,
                             )
                         )
             return BankLinkResult(bank_index=bank_index, bank_name=display_name, named_links=bank_named_links, unresolved=bank_unresolved)
@@ -1035,6 +925,10 @@ def build_named_audio_tree(
                 "audio_type",
                 "audio_type_confidence",
                 "audio_type_note",
+                "archive_offset",
+                "archive_size",
+                "duration_ms",
+                "sample_count_48k",
             ),
         )
         writer.writeheader()
@@ -1051,6 +945,10 @@ def build_named_audio_tree(
                     "audio_type": row.audio_type,
                     "audio_type_confidence": row.audio_type_confidence,
                     "audio_type_note": row.audio_type_note,
+                    "archive_offset": row.archive_offset,
+                    "archive_size": row.archive_size,
+                    "duration_ms": row.duration_ms,
+                    "sample_count_48k": row.sample_count_48k,
                 }
             )
 
@@ -1090,7 +988,7 @@ def build_named_audio_tree(
         f"Global media entries: {len(global_media)}",
         f"Global objects: {len(global_objects)}",
         f"Duplicate object IDs seen: {len(duplicate_object_ids)}",
-        f"Links created: {len(named_links)}",
+        f"Links indexed: {len(named_links)}",
         f"Unresolved notes: {len(unresolved)}",
         "",
         *[f"{archive_name}: {archive_counts[archive_name]} links" for archive_name in ("meta", "sfx", "streams")],

@@ -4,8 +4,8 @@ import hashlib
 import os
 import subprocess
 import tempfile
-import time
 import winsound
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -16,6 +16,19 @@ from dyingaudio.models import AudioEntry
 WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 WINDOWS_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
 VGMSTREAM_RAW_SUFFIXES = {".wem"}
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPreview:
+    """A preview that has completed any slow conversion work.
+
+    Preparing a preview is safe to do in a workspace-local background worker;
+    starting it touches the operating-system player and must stay on the Tk
+    thread.
+    """
+
+    source: Path
+    mode: str
 
 
 def _raw_source_prefers_vgmstream(path: Path) -> bool:
@@ -63,30 +76,40 @@ class PreviewPlayer:
         self._decoder_process: subprocess.Popen[bytes] | None = None
 
     def play_entry(self, entry: AudioEntry, log: Callable[[str], None]) -> Path:
-        self.stop()
+        return self.start_prepared(self.prepare_entry(entry, log), log)
+
+    def prepare_entry(self, entry: AudioEntry, log: Callable[[str], None]) -> PreparedPreview:
+        """Resolve and, only when necessary, render one entry for playback.
+
+        This method intentionally does not start or stop audio. Call it from a
+        background task, then hand the returned object to ``start_prepared`` on
+        the UI thread.
+        """
         if entry.source_mode == "raw":
             source = entry.resolved_source_path()
             if source is None or not source.exists():
                 raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
             if source.suffix.lower() == ".wav":
-                winsound.PlaySound(str(source), winsound.SND_ASYNC | winsound.SND_FILENAME)
-                self._current_path = source
-                self._playback_kind = "winsound"
-                log(f"Fast preview: winsound {source}")
-                return source
-        if self._start_fast_preview(entry, log):
-            preview_source = entry.resolved_source_path() if entry.source_mode == "raw" else entry.resolved_fsb_path()
-            if preview_source is None:
-                raise FileNotFoundError(f"Missing preview source for '{entry.entry_name}'.")
-            return preview_source
-        preview_path = self._prepare_preview_wav(entry, log)
-        winsound.PlaySound(None, 0)
-        winsound.PlaySound(str(preview_path), winsound.SND_ASYNC | winsound.SND_FILENAME)
-        self._current_path = preview_path
-        self._playback_kind = "winsound"
-        return preview_path
+                return PreparedPreview(source=source, mode="winsound")
+            if _raw_source_prefers_vgmstream(source):
+                if self.environment.vgmstream_path is not None and self.environment.ffplay_path is not None:
+                    return PreparedPreview(source=source, mode="vgmstream_pipe")
+            elif self.environment.ffplay_path is not None:
+                return PreparedPreview(source=source, mode="ffplay")
+
+        if entry.source_mode != "raw":
+            fsb_path = entry.resolved_fsb_path()
+            if fsb_path is None or not fsb_path.exists():
+                raise FileNotFoundError(f"Missing FSB file for '{entry.entry_name}'.")
+            if self.environment.vgmstream_path is not None and self.environment.ffplay_path is not None:
+                return PreparedPreview(source=fsb_path, mode="vgmstream_pipe")
+
+        return PreparedPreview(source=self._prepare_preview_wav(entry, log), mode="winsound")
 
     def play_combined_sources(self, sources: list[Path], log: Callable[[str], None]) -> Path:
+        return self.start_prepared(self.prepare_combined_sources(sources, log), log)
+
+    def prepare_combined_sources(self, sources: list[Path], log: Callable[[str], None]) -> PreparedPreview:
         if len(sources) < 2:
             raise ValueError("At least two sources are required to preview a combined mix.")
 
@@ -97,13 +120,44 @@ class PreviewPlayer:
                 raise FileNotFoundError(f"Missing preview source: {resolved}")
             resolved_sources.append(resolved)
 
-        self.stop()
         preview_path = self._prepare_combined_preview_wav(resolved_sources, log)
-        winsound.PlaySound(None, 0)
-        winsound.PlaySound(str(preview_path), winsound.SND_ASYNC | winsound.SND_FILENAME)
-        self._current_path = preview_path
-        self._playback_kind = "winsound"
-        return preview_path
+        return PreparedPreview(source=preview_path, mode="winsound")
+
+    def start_prepared(self, prepared: PreparedPreview, log: Callable[[str], None]) -> Path:
+        """Start an already prepared preview without waiting for codec work."""
+        self.stop()
+        source = prepared.source
+        if prepared.mode == "winsound":
+            winsound.PlaySound(str(source), winsound.SND_ASYNC | winsound.SND_FILENAME)
+            self._current_path = source
+            self._playback_kind = "winsound"
+            log(f"Fast preview: winsound {source}")
+            return source
+        if prepared.mode == "ffplay":
+            self._player_process = self._spawn_ffplay(source)
+            self._current_path = source
+            self._playback_kind = "process"
+            log(f"Fast preview: FFplay {source}")
+            return source
+        if prepared.mode == "vgmstream_pipe":
+            if self.environment.vgmstream_path is None:
+                raise RuntimeError("vgmstream is required for this preview.")
+            decode_command = [str(self.environment.vgmstream_path), "-p", str(source)]
+            log(" ".join(decode_command))
+            self._decoder_process = subprocess.Popen(
+                decode_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=WINDOWS_NO_WINDOW | WINDOWS_NEW_PROCESS_GROUP,
+            )
+            assert self._decoder_process.stdout is not None
+            self._player_process = self._spawn_ffplay("-", stdin=self._decoder_process.stdout)
+            self._decoder_process.stdout.close()
+            self._current_path = source
+            self._playback_kind = "process"
+            log(f"Fast preview: streaming {source.name} through vgmstream + FFplay")
+            return source
+        raise ValueError(f"Unsupported prepared preview mode '{prepared.mode}'.")
 
     def export_combined_sources(self, sources: list[Path], destination: str | Path, log: Callable[[str], None]) -> Path:
         if len(sources) < 2:
@@ -134,7 +188,7 @@ class PreviewPlayer:
         return self._playback_kind
 
     def has_live_process(self) -> bool:
-        return any(process is not None and process.poll() is None for process in (self._player_process, self._decoder_process))
+        return self._player_process is not None and self._player_process.poll() is None
 
     def clear_cache(self) -> None:
         self.stop()
@@ -289,67 +343,6 @@ class PreviewPlayer:
             raise RuntimeError(f"Could not decode preview for '{source.name}'.")
         self._cache[cache_key] = destination
         return destination
-
-    def _start_fast_preview(self, entry: AudioEntry, log: Callable[[str], None]) -> bool:
-        if entry.source_mode == "raw":
-            source = entry.resolved_source_path()
-            if source is None or not source.exists():
-                raise FileNotFoundError(f"Missing source file for '{entry.entry_name}'.")
-            if _raw_source_prefers_vgmstream(source):
-                if self.environment.vgmstream_path is None or self.environment.ffplay_path is None:
-                    return False
-                decode_command = [str(self.environment.vgmstream_path), "-p", str(source)]
-                log(" ".join(decode_command))
-                self._decoder_process = subprocess.Popen(
-                    decode_command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=WINDOWS_NO_WINDOW | WINDOWS_NEW_PROCESS_GROUP,
-                )
-                assert self._decoder_process.stdout is not None
-                self._player_process = self._spawn_ffplay("-", stdin=self._decoder_process.stdout)
-                self._decoder_process.stdout.close()
-                time.sleep(0.08)
-                if self._decoder_process.poll() not in (None, 0):
-                    self.stop()
-                    return False
-                self._current_path = source
-                self._playback_kind = "process"
-                log(f"Fast preview: streaming {entry.entry_name} through vgmstream + FFplay")
-                return True
-            if self.environment.ffplay_path is None:
-                return False
-            self._player_process = self._spawn_ffplay(source)
-            self._current_path = source
-            self._playback_kind = "process"
-            log(f"Fast preview: FFplay {source}")
-            return True
-
-        fsb_path = entry.resolved_fsb_path()
-        if fsb_path is None or not fsb_path.exists():
-            raise FileNotFoundError(f"Missing FSB file for '{entry.entry_name}'.")
-        if self.environment.vgmstream_path is None or self.environment.ffplay_path is None:
-            return False
-
-        decode_command = [str(self.environment.vgmstream_path), "-p", str(fsb_path)]
-        log(" ".join(decode_command))
-        self._decoder_process = subprocess.Popen(
-            decode_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=WINDOWS_NO_WINDOW | WINDOWS_NEW_PROCESS_GROUP,
-        )
-        assert self._decoder_process.stdout is not None
-        self._player_process = self._spawn_ffplay("-", stdin=self._decoder_process.stdout)
-        self._decoder_process.stdout.close()
-        time.sleep(0.08)
-        if self._decoder_process.poll() not in (None, 0):
-            self.stop()
-            return False
-        self._current_path = fsb_path
-        self._playback_kind = "process"
-        log(f"Fast preview: streaming {entry.entry_name} through vgmstream + FFplay")
-        return True
 
     def _cache_key(self, entry: AudioEntry, source: Path) -> str:
         stat = source.stat()
