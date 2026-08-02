@@ -129,7 +129,7 @@ def _shared_text(values: list[str]) -> str:
 
 def _media_signature_text(duration_ms: int, sample_count: int) -> str:
     if duration_ms <= 0 and sample_count <= 0:
-        return "Not indexed"
+        return "Not indexed — use Index Visible Metadata"
     return f"{duration_ms} ms / {sample_count} samples"
 
 
@@ -1671,7 +1671,10 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self._run_preview_task(
             start_message=f"Preparing preview for media {row.media_id}...",
             worker=worker,
-            on_started=lambda prepared: self._append_status(f"Previewing {prepared.source.name}."),
+            on_started=lambda prepared: (
+                self._refresh_media_tree(),
+                self._append_status(f"Previewing {prepared.source.name}."),
+            ),
         )
 
     def _play_selected_together(self) -> None:
@@ -1702,8 +1705,9 @@ class ExperimentalWwiseFrame(ttk.Frame):
         self._run_preview_task(
             start_message=f"Preparing mixed preview for {len(rows)} media file(s)...",
             worker=worker,
-            on_started=lambda prepared: self._append_status(
-                f"Previewing {len(rows)} files together from {prepared.source.name}."
+            on_started=lambda prepared: (
+                self._refresh_media_tree(),
+                self._append_status(f"Previewing {len(rows)} files together from {prepared.source.name}."),
             ),
         )
 
@@ -1740,7 +1744,10 @@ class ExperimentalWwiseFrame(ttk.Frame):
             start_message=f"Exporting mixed audio from {len(rows)} file(s)...",
             error_title="Export mixed audio failed",
             worker=worker,
-            on_success=lambda result: self._append_status(f"Exported mixed audio to {result}."),
+            on_success=lambda result: (
+                self._refresh_media_tree(),
+                self._append_status(f"Exported mixed audio to {result}."),
+            ),
         )
 
     def _stop_preview(self) -> None:
@@ -1775,8 +1782,9 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 cancel_event=self.task_runner.cancel_event,
                 workspace=self.workspace,
             ),
-            on_success=lambda result: self._append_status(
-                f"Exported {len(result) if isinstance(result, list) else 0} media file(s) to {destination}."
+            on_success=lambda result: (
+                self._refresh_media_tree(),
+                self._append_status(f"Exported {len(result) if isinstance(result, list) else 0} media file(s) to {destination}."),
             ),
         )
 
@@ -1813,7 +1821,10 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 progress=progress,
                 cancel_event=self.task_runner.cancel_event,
             ),
-            on_success=lambda result: self._append_status(f"Exported event folder to {result}."),
+            on_success=lambda result: (
+                self._refresh_media_tree(),
+                self._append_status(f"Exported event folder to {result}."),
+            ),
         )
 
     def _export_selected_bank_files(self) -> None:
@@ -1867,7 +1878,10 @@ class ExperimentalWwiseFrame(ttk.Frame):
                 progress=progress,
                 cancel_event=self.task_runner.cancel_event,
             ),
-            on_success=lambda result: self._append_status(f"Exported workspace dump to {result}."),
+            on_success=lambda result: (
+                self._refresh_media_tree(),
+                self._append_status(f"Exported workspace dump to {result}."),
+            ),
         )
 
     # ------------------------------------------------------------------
